@@ -8,6 +8,22 @@ struct PublicTransferObservation;
 struct RobustAuditTerminationOutput;
 struct RobustAuditAbortCertificate;
 
+// Verified evidence for one exact private relation. This receipt is not
+// authenticated MPC provenance and never authorizes release on its own.
+struct AuditRelationProofReceipt {
+    bool available = false;
+    bool proof_verified = false;
+    bool production_privacy_confirmed = false;
+    AuditRelationKernel kernel = AuditRelationKernel::UNKNOWN;
+    OperationRef operation_ref{};
+    uint64_t checkpoint = 0;
+    Digest relation_statement{};
+    uint32_t proof_system_id = 0;
+    size_t proof_word_count = 0;
+    Digest statement_binding{};
+    Digest artifact_commitment{};
+};
+
 // Backend boundary used by the application-layer accountability hooks.
 // A secure instantiation can replace DebugAuditBackend without changing
 // coSumcheck/PCS/encoding responsibility instrumentation.
@@ -20,6 +36,11 @@ public:
     virtual void OnImportStateMetadata(const AuditStateView&) {}
     virtual void OnBindPrivateState(
         const AuditStateView&, const std::vector<F>&) {}
+    virtual void OnBindPrivateStateSegments(
+        const AuditStateView& state, const std::vector<F>& local_share,
+        const std::vector<size_t>&) {
+        OnBindPrivateState(state, local_share);
+    }
     virtual bool OnBindPrivateStateAuthentication(
         const AuditStateView&, uint64_t, const Digest&) { return false; }
     virtual void OnBindPrivateFieldOperation(
@@ -60,6 +81,14 @@ public:
     // abort certificate only after public-abort verification has succeeded.
     virtual bool GetLastRobustAbortCertificate(
         RobustAuditAbortCertificate*) const { return false; }
+    // Optional read-only evidence for one exact private relation. This receipt
+    // is diagnostic proof evidence only; it is not authenticated MPC
+    // provenance and must never authorize release by itself.
+    virtual bool ReadRelationProofReceipt(
+        AuditRelationKernel, AuditRelationProofReceipt* receipt) const {
+        if (receipt) *receipt = AuditRelationProofReceipt{};
+        return false;
+    }
 
     virtual BatchCheckResult BatchCheck(const ObligationSet& scope) const = 0;
     virtual Violation Dispute(const ObligationSet& scope,

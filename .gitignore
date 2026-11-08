@@ -1,0 +1,42 @@
+# CMake / native build outputs
+/build/
+/build-pvia/
+/build-par/
+/Testing/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+
+# Rust build outputs
+**/target/
+
+# Python bytecode
+**/__pycache__/
+*.py[cod]
+
+# Experiment outputs and local logs
+/experiments/results/
+experiments/**/*.log
+experiments/**/*.exit
+
+# Compiled native / SP1 artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.elf
+*.proof
+*.core.proof
+*.rmeta
+*.rlib
+/experiments/sp1_provider/artifacts/
+/experiments/sp1_provider/elf/
+/experiments/sp1_god_output_provider/elf/
+/experiments/sp1_consistency_provider/artifacts/
+/experiments/sp1_registration_proof/elf/
+
+# Local verification builds and editor/source backups
+/build-pvia-ulfm-verify/
+*.bak_*
+*.tmp

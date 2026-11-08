@@ -40,6 +40,15 @@ PublicBlameStatement make_public_blame_statement(
 PublicBlameStatement make_public_blame_statement(
     const BlameCertificate& certificate);
 
+// Portable codec for proof-carrying PRIVATE_RECOVERY blame certificates.
+// The recovery receipt is embedded verbatim; decoding performs structural
+// and binding checks, while signature verification needs a pinned key registry.
+std::vector<u64> encode_private_recovery_blame_certificate(
+    const BlameCertificate& certificate);
+bool decode_private_recovery_blame_certificate(
+    const std::vector<u64>& words,
+    BlameCertificate* certificate);
+
 struct PublicBlameProofArtifact {
     bool available = false;
     bool cryptographically_authenticated = false;
@@ -48,6 +57,13 @@ struct PublicBlameProofArtifact {
     Digest proof_commitment{};
     Digest transcript_binding{};
     std::vector<u64> proof_words;
+    // Carries the independently verifiable VSS-recovery relation proof for
+    // PRIVATE_RECOVERY statements. Empty for PUBLIC_TRANSFER statements.
+    uint32_t recovery_proof_system_id = 0;
+    Digest recovery_proof_statement_binding{};
+    Digest recovery_proof_artifact_commitment{};
+    std::vector<u64> recovery_proof_statement_words;
+    std::vector<uint8_t> recovery_proof_artifact_bytes;
 };
 
 Digest compute_public_blame_proof_commitment(
@@ -58,6 +74,7 @@ bool validate_public_blame_proof_artifact(
 class PublicBlameProofEngine {
 public:
     virtual ~PublicBlameProofEngine() = default;
+    virtual Digest ProductionCapabilityBinding() const { return {}; }
     virtual PublicBlameProofArtifact Prove(
         const PublicBlameStatement& statement,
         const AuthenticatedRecoveryArtifact& recovery) const = 0;
@@ -77,6 +94,7 @@ struct ExternalPublicBlameProof {
 class PublicBlameProofBackend {
 public:
     virtual ~PublicBlameProofBackend() = default;
+    virtual Digest ProductionCapabilityBinding() const { return {}; }
     virtual ExternalPublicBlameProof Prove(
         const std::vector<u64>& public_inputs,
         const AuthenticatedRecoveryArtifact& recovery) const = 0;
@@ -95,6 +113,9 @@ public:
     bool Verify(
         const PublicBlameStatement& statement,
         const PublicBlameProofArtifact& proof) const override;
+    Digest ProductionCapabilityBinding() const override {
+        return backend_.ProductionCapabilityBinding();
+    }
 private:
     const PublicBlameProofBackend& backend_;
 };

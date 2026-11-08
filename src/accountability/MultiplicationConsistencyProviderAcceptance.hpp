@@ -13,7 +13,9 @@ struct MultiplicationConsistencyProviderAcceptanceResult {
     bool multiplication_verified = false;
     bool zero_case_verified = false;
     bool nonzero_case_verified = false;
+    bool authenticated_transport_used = false;
     uint32_t completed_stage = 0;
+    Digest authenticated_transport_capability_binding{};
     Digest capability_binding{};
     Digest multiplication_binding{};
     Digest zero_case_binding{};

@@ -166,6 +166,39 @@ MpcBackedAuthenticatedResidualProtocol::capabilities() const {
     return backend_.Capabilities();
 }
 
+Digest MpcBackedAuthenticatedResidualProtocol::ProductionCapabilityBinding() const {
+    if (!ready() ||
+        (required_security_ != RobustAuditSecurityLevel::MALICIOUS_ABORT &&
+         required_security_ != RobustAuditSecurityLevel::MALICIOUS_GOD))
+        return {};
+    const Digest backend_binding = backend_.ProductionCapabilityBinding();
+    const ResidualMpcCapabilities current = capabilities();
+    if (backend_binding == Digest{} ||
+        !validate_residual_mpc_capabilities(current) ||
+        !residual_mpc_satisfies(current, required_security_))
+        return {};
+    std::vector<u64> words = {
+        RESIDUAL_MPC_CAP_DOMAIN, 0x50524f4443415031ULL,
+        static_cast<u64>(required_security_)};
+    append_digest_words(backend_binding, &words);
+    append_digest_words(current.capability_binding, &words);
+    return hash_words(words);
+}
+
+bool MpcBackedAuthenticatedResidualProtocol::SupportsObliviousAudit(
+    const ObligationSet& scope) const {
+    return ready_for_scope(scope) && backend_.SupportsObliviousAudit(scope);
+}
+
+ObliviousLocalizationPublicResult
+MpcBackedAuthenticatedResidualProtocol::AuditObliviously(
+    const ObligationSet& scope, const LocalResidualBatchView& local_view,
+    int rank, int world_size) const {
+    if (!ready_for_scope(scope) || !backend_.SupportsObliviousAudit(scope))
+        return {};
+    return backend_.AuditObliviously(scope, local_view, rank, world_size);
+}
+
 CollectiveResidualCommitmentSet
 MpcBackedAuthenticatedResidualProtocol::CommitResidualBatch(
     const ObligationSet& scope,

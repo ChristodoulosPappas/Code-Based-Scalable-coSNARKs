@@ -6,6 +6,19 @@
 namespace pvia {
 namespace {
 
+bool native_sumcheck_kernel_index(
+    AuditRelationKernel kernel, size_t* index) {
+    if (!index) return false;
+    switch (kernel) {
+        case AuditRelationKernel::COSUMCHECK_ZERO: *index = 0; return true;
+        case AuditRelationKernel::COSUMCHECK_QUADRATIC: *index = 1; return true;
+        case AuditRelationKernel::COSUMCHECK_BATCH: *index = 2; return true;
+        case AuditRelationKernel::DSC_QUADRATIC: *index = 3; return true;
+        case AuditRelationKernel::DSC_CUBIC: *index = 4; return true;
+        default: return false;
+    }
+}
+
 bool has_required_kernel(
     const SecureAuditComponents& components,
     AuditRelationKernel kernel) {
@@ -84,8 +97,15 @@ bool ComposedSecureAuditProvider::Ready(
         const bool legacy_ready =
             requirements.private_security_level ==
                 RobustAuditSecurityLevel::MALICIOUS_GOD &&
-            components_.collective_engine && components_.recovery_engine &&
-            components_.private_blame_proof_engine;
+            components_.collective_engine &&
+            components_.collective_engine->ProductionCapabilityBinding() != Digest{} &&
+            components_.recovery_engine &&
+            components_.recovery_engine->ProductionCapabilityBinding() != Digest{} &&
+            components_.private_blame_proof_engine &&
+            components_.private_blame_proof_engine->ProductionCapabilityBinding() != Digest{};
+        // Non-null pointers (including fail-closed adapters) are not a
+        // security claim. Legacy engines must expose an explicit production
+        // capability binding before they can satisfy composition readiness.
         if (!robust_ready && !legacy_ready) return false;
         if (!robust_ready) {
             for (AuditRelationKernel kernel : requirements.required_kernels) {
@@ -95,17 +115,62 @@ bool ComposedSecureAuditProvider::Ready(
     }
     if (requirements.transfer_lane) {
         if (!components_.transfer_engine ||
-            !components_.transfer_blame_proof_engine)
+            components_.transfer_engine->ProductionCapabilityBinding() == Digest{} ||
+            !components_.transfer_blame_proof_engine ||
+            components_.transfer_blame_proof_engine->ProductionCapabilityBinding() == Digest{})
             return false;
     }
     return true;
 }
 
 void ComposedSecureAuditProvider::FinalizeInvalidMaterial(
-    const AuditOperationView&) {}
+    const AuditOperationView& operation) {
+    size_t index = 0;
+    if (native_sumcheck_kernel_index(operation.kernel, &index))
+        ++native_sumcheck_invalid_count_;
+}
 
 void ComposedSecureAuditProvider::FinalizeUnavailableResidual(
-    const AuditOperationView&, const PrivateResidualHandle&) {}
+    const AuditOperationView& operation, const PrivateResidualHandle&) {
+    size_t index = 0;
+    if (native_sumcheck_kernel_index(operation.kernel, &index))
+        ++native_sumcheck_unavailable_count_;
+}
+
+void ComposedSecureAuditProvider::OnResidualFinalized(
+    const AuditOperationView& operation,
+    const PrivateResidualHandle& handle) {
+    size_t index = 0;
+    if (native_sumcheck_kernel_index(operation.kernel, &index) &&
+        handle.available && handle.ref == operation.ref &&
+        handle.checkpoint == operation.checkpoint)
+        ++native_sumcheck_finalized_counts_[index];
+}
+
+bool ComposedSecureAuditProvider::ReadRelationProofReceipt(
+    AuditRelationKernel kernel,
+    AuditRelationProofReceipt* receipt) const {
+    if (!receipt) return false;
+    *receipt = AuditRelationProofReceipt{};
+    if (!components_.native_sumcheck_proof_provider) return false;
+    Sp1SumcheckProofReceipt native;
+    if (!components_.native_sumcheck_proof_provider->ReadLatestReceipt(
+            kernel, &native))
+        return false;
+    receipt->available = native.available;
+    receipt->proof_verified = native.proof_verified;
+    receipt->production_privacy_confirmed =
+        native.production_privacy_confirmed;
+    receipt->kernel = native.kernel;
+    receipt->operation_ref = native.operation_ref;
+    receipt->checkpoint = native.checkpoint;
+    receipt->relation_statement = native.relation_statement;
+    receipt->proof_system_id = native.proof_system_id;
+    receipt->proof_word_count = native.proof_word_count;
+    receipt->statement_binding = native.statement_binding;
+    receipt->artifact_commitment = native.artifact_commitment;
+    return receipt->available && receipt->proof_verified;
+}
 
 PrivateResidualHandle ComposedSecureAuditProvider::UnavailableResidual(
     const AuditOperationView& operation,
@@ -143,6 +208,37 @@ PrivateResidualHandle
 ComposedSecureAuditProvider::EvaluateUnsupportedKernelResidual(
     const AuditOperationView& operation, AuditRelationKernel kernel) {
     return UnavailableResidual(operation, kernel);
+}
+
+bool run_secure_audit_composition_readiness_selftest() {
+    FailClosedCollectiveResidualEngine collective;
+    FailClosedAuthenticatedAuditRecoveryEngine recovery;
+    FailClosedPublicBlameProofEngine private_blame;
+    SecureAuditComponents private_components;
+    private_components.collective_engine = &collective;
+    private_components.recovery_engine = &recovery;
+    private_components.private_blame_proof_engine = &private_blame;
+    SecureAuditRequirements private_requirements;
+    private_requirements.private_lane = true;
+    private_requirements.transfer_lane = false;
+    private_requirements.private_security_level =
+        RobustAuditSecurityLevel::MALICIOUS_GOD;
+    ComposedSecureAuditProvider private_provider(
+        private_components, true, RobustAuditSecurityLevel::MALICIOUS_GOD);
+    if (private_provider.Ready(private_requirements)) return false;
+
+    FailClosedPublicTransferCheckEngine transfer;
+    FailClosedPublicTransferBlameProofEngine transfer_blame;
+    SecureAuditComponents transfer_components;
+    transfer_components.transfer_engine = &transfer;
+    transfer_components.transfer_blame_proof_engine = &transfer_blame;
+    SecureAuditRequirements transfer_requirements;
+    transfer_requirements.private_lane = false;
+    transfer_requirements.transfer_lane = true;
+    ComposedSecureAuditProvider transfer_provider(
+        transfer_components, false, RobustAuditSecurityLevel::MALICIOUS_GOD);
+    return !transfer_provider.Ready(transfer_requirements) &&
+        run_authenticated_audit_recovery_verifier_selftest();
 }
 
 SecureAuditRuntimeBundle::SecureAuditRuntimeBundle(

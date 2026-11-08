@@ -10,6 +10,7 @@ namespace pvia {
 class Ed25519PublicTransferBlameProofBackend final
     : public PublicTransferBlameProofBackend {
 public:
+    Digest ProductionCapabilityBinding() const override;
     ExternalPublicBlameProof Prove(
         const std::vector<u64>& public_inputs,
         const std::vector<u64>& transfer_evidence) const override;

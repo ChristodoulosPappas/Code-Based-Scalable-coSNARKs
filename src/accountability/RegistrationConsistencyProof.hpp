@@ -6,6 +6,22 @@
 
 namespace pvia {
 
+// The public native-state provenance supplied to registration. These
+// non-secret identifiers/digests bind a proof statement; they do not
+// themselves authenticate a native share or prove equality of secrets.
+struct RegistrationNativeContext {
+    StateId native_state_id = 0;
+    uint64_t authentication_scheme_id = 0;
+    Digest authentication_binding{};
+    Digest predecessor_root{};
+    Digest checkpoint_root{};
+};
+
+bool validate_registration_native_context(
+    const RegistrationNativeContext& context);
+Digest compute_registration_native_context_binding(
+    const RegistrationNativeContext& context);
+
 struct RegistrationConsistencyStatement {
     uint64_t sid = 0;
     CheckpointId checkpoint = 0;
@@ -15,12 +31,19 @@ struct RegistrationConsistencyStatement {
     size_t output_element_count = 0;
     Digest public_state_digest{};
     Digest public_actual_digest{};
+    // Public binding of the native FOLD_RS challenge used to evaluate the
+    // registered transition. Do not treat this as a hiding commitment.
+    Digest public_challenge_binding{};
+    RegistrationNativeContext native_context{};
     Digest operation_statement_binding{};
     Digest sharing_transcript_binding{};
     Digest statement_binding{};
 };
 
 Digest compute_registration_consistency_statement_binding(
+    const RegistrationConsistencyStatement& statement);
+// Canonical public 46-u64 SP1 statement. No native shares or VSS coefficients.
+std::vector<u64> encode_registration_consistency_statement_words(
     const RegistrationConsistencyStatement& statement);
 bool validate_registration_consistency_statement(
     const RegistrationConsistencyStatement& statement);
@@ -48,6 +71,9 @@ struct RegistrationConsistencyCapabilities {
     bool malicious_sound = false;
     bool zero_knowledge = false;
     bool binds_sharing_transcript = false;
+    // A reference/synthetic proof must never be admitted via a generic
+    // runtime production-ready capability check.
+    bool reference_test_only = false;
     uint64_t protocol_id = 0;
     Digest implementation_binding{};
     Digest capability_binding{};
@@ -63,8 +89,20 @@ bool production_ready_registration_consistency_capabilities(
 struct RegistrationConsistencyWitness {
     std::vector<F> state_values;
     std::vector<F> actual_output;
+    // Public FOLD challenge used in the native transition, not a secret.
+    F public_challenge{};
+    // Encoded PRIVATE ReferenceVssDealerWitness. Never serialize in a
+    // public proof artifact or transmit to a verifier.
     std::vector<u64> sharing_witness_words;
 };
+
+// Concrete reference relation, evaluated only where the dealer witness
+// is available. Checks FOLD semantics and that the polynomial constants
+// of the VSS encoding match the native values. NOT a ZK proof or a
+// production distributed proof backend.
+bool evaluate_reference_registration_consistency_relation(
+    const RegistrationConsistencyStatement& statement,
+    const RegistrationConsistencyWitness& witness);
 
 class RegistrationConsistencyProofBackend {
 public:

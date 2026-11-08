@@ -1,6 +1,7 @@
 #pragma once
 
 #include "PVIA.hpp"
+#include "AuthenticatedMpcAbortEvidence.hpp"
 
 #include <vector>
 
@@ -45,6 +46,68 @@ bool decode_multiplication_consistency_proof_artifact(
     MultiplicationConsistencyProofArtifact* proof);
 Digest compute_multiplication_consistency_set_binding(
     const std::vector<MultiplicationConsistencyProofArtifact>& proofs);
+
+// Publicly verifiable, event-bound report that a participant signed a
+// refusal after its local multiplication-consistency witness preflight failed.
+// This proves the sender's signed protocol-failure report, NOT by itself the
+// mathematical falsity of the hidden product relation.
+inline constexpr u64 REFERENCE_MULTIPLICATION_FAILURE_PROTOCOL_DOMAIN =
+    0x505653484d415554ULL; // PVSHMAUT
+inline constexpr u64 REFERENCE_MULTIPLICATION_FAILURE_STATUS_KIND =
+    0x4d554c4641494c31ULL; // MULFAIL1
+inline constexpr u64 REFERENCE_MULTIPLICATION_FAILURE_STATUS_DOMAIN =
+    0x50564d554c464149ULL; // PVMULFAI
+
+enum class ReferenceMultiplicationFailureCode : uint64_t {
+    NONE = 0,
+    RELATION_PRECHECK_FAILED = 4
+};
+
+struct ReferenceMultiplicationRsEvent {
+    uint64_t sid = 0;
+    CheckpointId checkpoint = 0;
+    uint64_t multiplication_id = 0;
+    uint32_t world_size = 0;
+    uint32_t threshold = 0;
+    Digest lhs_sharing_binding{};
+    Digest rhs_sharing_binding{};
+    Digest joint_seed{};
+    Digest joint_seed_binding{};
+    F syndrome{};
+    Digest syndrome_opening_binding{};
+    std::vector<Digest> output_sharing_bindings;
+    Digest event_binding{};
+};
+
+Digest compute_reference_multiplication_rs_event_binding(
+    const ReferenceMultiplicationRsEvent& event);
+bool validate_reference_multiplication_rs_event(
+    const ReferenceMultiplicationRsEvent& event);
+std::vector<u64> encode_reference_multiplication_failure_status(
+    const ReferenceMultiplicationRsEvent& event,
+    uint32_t sender, uint64_t failure_code);
+
+struct ReferenceMultiplicationFailureCertificate {
+    bool available = false;
+    ReferenceMultiplicationRsEvent event{};
+    uint32_t accused_dealer = 0;
+    uint64_t failure_code = 0;
+    AuthenticatedMpcMessageContext status_context{};
+    std::vector<std::vector<u64>> status_payloads;
+    std::vector<AuthenticatedMpcSignedEnvelopeObservation> status_observations;
+    Digest registry_commitment{};
+    Digest certificate_binding{};
+};
+
+Digest compute_reference_multiplication_failure_certificate_binding(
+    const ReferenceMultiplicationFailureCertificate& certificate);
+bool validate_reference_multiplication_failure_certificate(
+    const ReferenceMultiplicationFailureCertificate& certificate);
+std::vector<u64> encode_reference_multiplication_failure_certificate(
+    const ReferenceMultiplicationFailureCertificate& certificate);
+bool decode_reference_multiplication_failure_certificate(
+    const std::vector<u64>& words,
+    ReferenceMultiplicationFailureCertificate* certificate);
 
 struct MultiplicationConsistencyCapabilities {
     bool available = false;

@@ -231,6 +231,61 @@ BatchCheckResult ProtocolBackedCollectiveResidualEngine::BatchCheck(
     return result;
 }
 
+ObliviousLocalizationPublicResult
+ProtocolBackedCollectiveResidualEngine::DisputeObliviously(
+    const ObligationSet& scope, const BatchCheckResult& batch,
+    const LocalResidualBatchView& local_view,
+    int rank, int world_size) const {
+    // The only acceptable provider opens a canonical public j*, and never
+    // reveals q*, the protected branch or an operation-indexed proof tag.
+    // An ordinary recursive subset backend cannot be silently upgraded.
+    if(rank<0 || world_size<4 || rank>=world_size ||
+       scope.operations.empty() ||
+       !validate_collective_batch_result(scope,batch,world_size) ||
+       batch.ok || !local_view.complete_for_owner ||
+       !local_view.all_authenticated ||
+       !protocol_.SupportsObliviousLocalization())
+        return {};
+    const auto result=protocol_.LocalizeObliviously(
+        scope,batch,local_view,rank,world_size);
+    if(!result.available || !result.cryptographically_authenticated ||
+       !result.found || result.attributed_party>=static_cast<uint32_t>(world_size) ||
+       result.checkpoint!=scope.checkpoint ||
+       result.batch_result_binding!=compute_collective_batch_result_binding(batch) ||
+       result.public_evidence_binding==Digest{})
+        return {};
+    return result;
+}
+
+ObliviousLocalizationPublicResult
+ProtocolBackedCollectiveResidualEngine::AuditObliviously(
+    const ObligationSet& scope, const LocalResidualBatchView& local_view,
+    int rank, int world_size) const {
+    // This path deliberately has no public BatchCheckResult parameter. The
+    // private-mode backend computes the batch verdict and owner selection
+    // internally, and may return only clean/fault plus the owner identifier.
+    if (rank < 0 || world_size < 4 || rank >= world_size ||
+        scope.operations.empty() || scope.operations.size() > 64 ||
+        !local_view.complete_for_owner || !local_view.all_authenticated ||
+        !protocol_.SupportsObliviousAudit(scope))
+        return {};
+    const auto result = protocol_.AuditObliviously(
+        scope, local_view, rank, world_size);
+    if (!result.available || !result.cryptographically_authenticated ||
+        result.checkpoint != scope.checkpoint ||
+        result.batch_result_binding == Digest{} ||
+        result.public_evidence_binding == Digest{} ||
+        (result.found && result.attributed_party >=
+            static_cast<uint32_t>(world_size)) ||
+        (!result.found && result.attributed_party != 0))
+        return {};
+    return result;
+}
+
+// LEGACY REFERENCE MODE ONLY. The public subset test returns a clear bool,
+// the selected subset changes with that bool, and both the branch and
+// operation identifier are committed to the recursive transcript. This path
+// is not oblivious and MUST NOT be used to claim hidden internal q*.
 CollectiveDisputeResult ProtocolBackedCollectiveResidualEngine::Dispute(
     const ObligationSet& scope,
     const BatchCheckResult& batch,
@@ -280,17 +335,21 @@ CollectiveDisputeResult ProtocolBackedCollectiveResidualEngine::Dispute(
                 candidates.begin() + mid, candidates.end());
             const ResidualSubsetDescriptor right_subset =
                 make_residual_subset_descriptor(batch, right, depth);
-            const ResidualSubsetCheckResult right_result =
-                protocol_.CheckResidualSubset(
-                    scope, batch, right_subset, local_view, rank, world_size);
-            if (!validate_residual_subset_check(
-                    batch, right_subset, right_result) || !right_result.failed)
+            if (right_subset.operations.empty() ||
+                right_subset.binding == Digest{})
                 return unavailable_dispute(scope);
+
+            // All subset fingerprints use the same batch-global random
+            // coefficients.  The current parent is known to have a nonzero
+            // fingerprint; if the checked left child is zero, additivity
+            // implies the complementary right child is nonzero.  Bind that
+            // inference to the clean-left proof rather than running a second
+            // MPC zero test.
             transcript_words.push_back(depth);
             transcript_words.push_back(1);
             append_digest_words(right_subset.binding, transcript_words);
-            append_digest_words(right_result.proof_commitment, transcript_words);
-            transcript_words.push_back(1);
+            append_digest_words(left_result.proof_commitment, transcript_words);
+            transcript_words.push_back(2); // inferred-failing complement
             candidates = std::move(right);
         }
         ++depth;

@@ -17,6 +17,7 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <mpi.h>
 
 namespace pvia {
 namespace {
@@ -170,20 +171,86 @@ Digest hash_bytes(const uint8_t* data, size_t size) {
     return out;
 }
 
+Digest hash_word_span(const u64* words, size_t count) {
+    if (count == 0) return hash_bytes(nullptr, 0);
+    if (!words) return Digest{};
+    return hash_bytes(
+        reinterpret_cast<const uint8_t*>(words), count * sizeof(u64));
+}
+
 Digest hash_words(const std::vector<u64>& words) {
-    if (words.empty()) return hash_bytes(nullptr, 0);
-    return hash_bytes(reinterpret_cast<const uint8_t*>(words.data()),
-                      words.size() * sizeof(u64));
+    return hash_word_span(words.data(), words.size());
 }
 
 Digest hash_field_vector(const std::vector<F>& values) {
-    std::vector<u64> words;
-    words.reserve(values.size() * 2);
-    for (const auto& x : values) {
-        words.push_back(x.real);
-        words.push_back(x.img);
+    // Canonical field-vector encoding is (real,img) per element. F itself is
+    // laid out as (img,real), so hashing raw object memory would silently
+    // change transcript/state digests. Stream bounded chunks in canonical
+    // order to avoid a full-size temporary vector without changing bytes.
+    Digest out;
+    blake3_hasher hasher;
+    blake3_hasher_init(&hasher);
+    constexpr size_t FIELDS_PER_CHUNK = 1024;
+    std::array<u64, 2 * FIELDS_PER_CHUNK> words{};
+    for (size_t base = 0; base < values.size(); base += FIELDS_PER_CHUNK) {
+        const size_t count =
+            std::min(FIELDS_PER_CHUNK, values.size() - base);
+        for (size_t i = 0; i < count; ++i) {
+            words[2 * i] = values[base + i].real;
+            words[2 * i + 1] = values[base + i].img;
+        }
+        blake3_hasher_update(
+            &hasher,
+            reinterpret_cast<const uint8_t*>(words.data()),
+            2 * count * sizeof(u64));
     }
-    return hash_words(words);
+    blake3_hasher_finalize(&hasher, out.bytes.data(), out.bytes.size());
+    return out;
+}
+
+Digest hash_field_slices(
+    const std::vector<FieldStateSegment>& segments) {
+    // Byte-for-byte equivalent to hashing the concatenation of the selected
+    // field ranges in order. Slice boundaries are deliberately not encoded.
+    Digest out;
+    blake3_hasher hasher;
+    blake3_hasher_init(&hasher);
+    constexpr size_t FIELDS_PER_CHUNK = 1024;
+    std::array<u64, 2 * FIELDS_PER_CHUNK> words{};
+    for (const auto& segment : segments) {
+        if (!segment.values ||
+            segment.offset > segment.values->size() ||
+            segment.count > segment.values->size() - segment.offset)
+            return Digest{};
+        size_t consumed = 0;
+        while (consumed < segment.count) {
+            const size_t count = std::min(
+                FIELDS_PER_CHUNK, segment.count - consumed);
+            const size_t base = segment.offset + consumed;
+            for (size_t i = 0; i < count; ++i) {
+                words[2 * i] = (*segment.values)[base + i].real;
+                words[2 * i + 1] = (*segment.values)[base + i].img;
+            }
+            blake3_hasher_update(
+                &hasher,
+                reinterpret_cast<const uint8_t*>(words.data()),
+                2 * count * sizeof(u64));
+            consumed += count;
+        }
+    }
+    blake3_hasher_finalize(&hasher, out.bytes.data(), out.bytes.size());
+    return out;
+}
+
+Digest hash_field_segments(
+    const std::vector<const std::vector<F>*>& segments) {
+    std::vector<FieldStateSegment> slices;
+    slices.reserve(segments.size());
+    for (const auto* segment : segments) {
+        if (!segment) return Digest{};
+        slices.push_back(FieldStateSegment{segment, 0, segment->size()});
+    }
+    return hash_field_slices(slices);
 }
 
 Digest hash_quadratic(const quadratic_poly& poly) {
@@ -299,6 +366,16 @@ Digest compute_residual_commitment(const Label& label, RelationKind relation,
     return hash_words(words);
 }
 
+uint64_t phase_round_index_key(Phase phase, uint32_t round) {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(phase)) << 32) |
+           static_cast<uint64_t>(round);
+}
+
+uint64_t phase_owner_index_key(Phase phase, uint32_t owner) {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(phase)) << 32) |
+           static_cast<uint64_t>(owner);
+}
+
 Runtime& Runtime::instance() {
     static Runtime runtime;
     return runtime;
@@ -309,6 +386,22 @@ void Runtime::initialize_from_environment(int rank, int world_size) {
     world_size_ = world_size;
     config_.enabled = env_flag("PVIA_ENABLE", false);
     config_.verbose = env_flag("PVIA_VERBOSE", false);
+    external_release_anchor_required_ = env_flag(
+        "PVIA_REQUIRE_EXTERNAL_RELEASE_ANCHOR", false);
+    external_release_anchor_gate_ = {};
+    require_private_residual_provenance_ = env_flag(
+        "PVIA_P105_REQUIRE_PRIVATE_RESIDUAL_PROVENANCE", false);
+    private_residual_provenance_gate_started_ = false;
+    private_residual_source_bound_ = false;
+    private_residual_provenance_authorized_ = false;
+    private_residual_statement_binding_ = Digest{};
+    private_residual_computation_binding_ = Digest{};
+    private_residual_check_transcript_binding_ = Digest{};
+    private_residual_issuer_id_ = 0;
+    private_residual_minimum_sequence_ = 0;
+    private_residual_expected_round_ = 0;
+    private_residual_provenance_release_consumed_ = false;
+    private_residual_provenance_consumed_round_ = 0;
     config_.session_id = static_cast<uint64_t>(
         env_int("PVIA_SESSION_ID", 1));
     reset_experiment_metrics_from_environment(
@@ -317,11 +410,34 @@ void Runtime::initialize_from_environment(int rank, int world_size) {
     next_id_ = 1;
     next_state_id_ = 1;
     states_.clear();
+    state_index_.clear();
     operations_.clear();
+    operation_index_.clear();
+    latest_active_by_phase_.clear();
+    latest_active_by_phase_owner_.clear();
     checkpoints_.clear();
+    checkpoint_index_.clear();
+    latest_checkpoint_index_.clear();
     public_transfer_refs_.clear();
+    public_transfer_ref_set_.clear();
     violations_.clear();
     certificates_.clear();
+    // The accountability runtime records thousands of short-lived operations
+    // in the larger paper configurations.  Reserving the common-case capacity
+    // avoids repeated relocation/rehashing without changing canonical order.
+    states_.reserve(32);
+    state_index_.reserve(64);
+    operations_.reserve(4096);
+    operation_index_.reserve(4096);
+    latest_active_by_phase_.reserve(32);
+    latest_active_by_phase_owner_.reserve(256);
+    checkpoints_.reserve(256);
+    checkpoint_index_.reserve(256);
+    latest_checkpoint_index_.reserve(256);
+    public_transfer_refs_.reserve(4096);
+    public_transfer_ref_set_.reserve(4096);
+    violations_.reserve(64);
+    certificates_.reserve(16);
     next_violation_sequence_ = 1;
     pending_valid_ = false;
     next_commit_predecessor_ = OperationRef{};
@@ -334,6 +450,8 @@ void Runtime::initialize_from_environment(int rank, int world_size) {
 
     auto& transfer_auth = Ed25519TransferAuthenticator::instance();
     if (config_.enabled) {
+        ExperimentDurationScope runtime_init_metrics_scope(
+            ExperimentDurationKind::RUNTIME_INIT);
         const bool registry_ready = transfer_auth.Initialize(rank_, world_size_);
         if (registry_ready) {
             ExperimentControlTrafficScope traffic_scope(
@@ -385,17 +503,10 @@ StateId Runtime::import_state(const std::string& name, Phase phase,
                               const std::vector<F>& local_share) {
     if (!config_.enabled) return 0;
 
-    std::vector<u64> words;
-    words.reserve(local_share.size() * 2);
-    for (const auto& x : local_share) {
-        words.push_back(x.real);
-        words.push_back(x.img);
-    }
-
     StateRecord state;
     state.id = next_state_id_++;
     state.name = name;
-    state.digest = hash_words(words);
+    state.digest = hash_field_vector(local_share);
     state.label.sid = config_.session_id;
     state.label.phase = phase;
     state.label.round = 0;
@@ -403,10 +514,20 @@ StateId Runtime::import_state(const std::string& name, Phase phase,
     state.label.obligation = Obligation::DERIVE;
     state.label.object_id = state.id;
     states_.push_back(state);
-    if (audit_backend_override_) {
+    state_index_[state.id] = states_.size() - 1;
+    if (audit_backend_override_ || source_observer_) {
         const AuditStateView view = make_audit_state_view(states_.back());
-        audit_backend_override_->OnImportStateMetadata(view);
-        audit_backend_override_->OnBindPrivateState(view, local_share);
+        const std::vector<size_t> segment_lengths{local_share.size()};
+        if (audit_backend_override_) {
+            audit_backend_override_->OnImportStateMetadata(view);
+            audit_backend_override_->OnBindPrivateStateSegments(
+                view, local_share, segment_lengths);
+        }
+        if (source_observer_) {
+            source_observer_->OnImportStateMetadata(view);
+            source_observer_->OnBindPrivateStateSegments(
+                view, local_share, segment_lengths);
+        }
     }
 
     if (config_.verbose) {
@@ -418,19 +539,134 @@ StateId Runtime::import_state(const std::string& name, Phase phase,
     return state.id;
 }
 
+StateId Runtime::import_state_segments(
+    const std::string& name, Phase phase,
+    const std::vector<const std::vector<F>*>& segments) {
+    if (segments.empty()) return 0;
+    std::vector<FieldStateSegment> slices;
+    slices.reserve(segments.size());
+    for (const auto* segment : segments) {
+        if (!segment) return 0;
+        slices.push_back(FieldStateSegment{segment, 0, segment->size()});
+    }
+    return import_state_slices(name, phase, slices);
+}
+
+StateId Runtime::import_state_slices(
+    const std::string& name, Phase phase,
+    const std::vector<FieldStateSegment>& segments) {
+    if (!config_.enabled || segments.empty()) return 0;
+
+    StateRecord state;
+    state.id = next_state_id_++;
+    state.name = name;
+    state.digest = hash_field_slices(segments);
+    if (state.digest == Digest{}) return 0;
+    state.label.sid = config_.session_id;
+    state.label.phase = phase;
+    state.label.round = 0;
+    state.label.owner = static_cast<uint32_t>(rank_);
+    state.label.obligation = Obligation::DERIVE;
+    state.label.object_id = state.id;
+    states_.push_back(state);
+    state_index_[state.id] = states_.size() - 1;
+
+    if (audit_backend_override_ || source_observer_) {
+        size_t total = 0;
+        std::vector<size_t> segment_lengths;
+        segment_lengths.reserve(segments.size());
+        for (const auto& segment : segments) {
+            if (!segment.values ||
+                segment.offset > segment.values->size() ||
+                segment.count > segment.values->size() - segment.offset ||
+                total > std::numeric_limits<size_t>::max() - segment.count)
+                return 0;
+            total += segment.count;
+            segment_lengths.push_back(segment.count);
+        }
+        std::vector<F> concatenated;
+        concatenated.reserve(total);
+        for (const auto& segment : segments) {
+            concatenated.insert(
+                concatenated.end(),
+                segment.values->begin() +
+                    static_cast<std::ptrdiff_t>(segment.offset),
+                segment.values->begin() +
+                    static_cast<std::ptrdiff_t>(
+                        segment.offset + segment.count));
+        }
+        const AuditStateView view = make_audit_state_view(states_.back());
+        if (audit_backend_override_) {
+            audit_backend_override_->OnImportStateMetadata(view);
+            audit_backend_override_->OnBindPrivateStateSegments(
+                view, concatenated, segment_lengths);
+        }
+        if (source_observer_) {
+            source_observer_->OnImportStateMetadata(view);
+            source_observer_->OnBindPrivateStateSegments(
+                view, concatenated, segment_lengths);
+        }
+    }
+
+    if (config_.verbose) {
+        std::cout << "[PVIA][rank " << rank_ << "] import sliced state "
+                  << name << " id=" << state.id
+                  << " digest=" << state.digest.hex().substr(0, 12)
+                  << "... segments=" << segments.size() << "\n";
+    }
+    return state.id;
+}
+
+
+StateId Runtime::import_state_prehashed(
+    const std::string& name, Phase phase,
+    const std::vector<F>& local_share, const Digest& digest) {
+    if (!config_.enabled || digest == Digest{}) return 0;
+
+    StateRecord state;
+    state.id = next_state_id_++;
+    state.name = name;
+    state.digest = digest;
+    state.label.sid = config_.session_id;
+    state.label.phase = phase;
+    state.label.round = 0;
+    state.label.owner = static_cast<uint32_t>(rank_);
+    state.label.obligation = Obligation::DERIVE;
+    state.label.object_id = state.id;
+    states_.push_back(state);
+    state_index_[state.id] = states_.size() - 1;
+
+    if (audit_backend_override_ || source_observer_) {
+        const AuditStateView view = make_audit_state_view(states_.back());
+        const std::vector<size_t> segment_lengths{local_share.size()};
+        if (audit_backend_override_) {
+            audit_backend_override_->OnImportStateMetadata(view);
+            audit_backend_override_->OnBindPrivateStateSegments(
+                view, local_share, segment_lengths);
+        }
+        if (source_observer_) {
+            source_observer_->OnImportStateMetadata(view);
+            source_observer_->OnBindPrivateStateSegments(
+                view, local_share, segment_lengths);
+        }
+    }
+    return state.id;
+}
+
 bool Runtime::bind_state_authentication(
     StateId state_id, uint64_t scheme_id,
     const Digest& authentication_binding) {
     if (!config_.enabled || !audit_backend_override_ || state_id == 0 ||
         scheme_id == 0 || authentication_binding == Digest{})
         return false;
-    for (const auto& state : states_) {
-        if (state.id != state_id) continue;
-        return audit_backend_override_->OnBindPrivateStateAuthentication(
-            make_audit_state_view(state), scheme_id,
-            authentication_binding);
-    }
-    return false;
+    const auto state_it = state_index_.find(state_id);
+    if (state_it == state_index_.end() ||
+        state_it->second >= states_.size())
+        return false;
+    const StateRecord& state = states_[state_it->second];
+    return audit_backend_override_->OnBindPrivateStateAuthentication(
+        make_audit_state_view(state), scheme_id,
+        authentication_binding);
 }
 
 AuditStateView Runtime::make_audit_state_view(
@@ -485,6 +721,23 @@ AuditCheckpointView Runtime::make_audit_checkpoint_view(
     return view;
 }
 
+bool Runtime::set_source_observer(AuditBackend* observer) {
+    if (observer == source_observer_) return true;
+    // The native private shares and operation payloads are callback-only.
+    // Never attach an observer after the protocol has started.
+    if (observer && (!states_.empty() || !operations_.empty() ||
+                     !checkpoints_.empty() ||
+                     observer == audit_backend_override_))
+        return false;
+    source_observer_ = observer;
+    return true;
+}
+
+void Runtime::set_external_release_anchor_gate(
+    ExternalReleaseAnchorGate gate) {
+    external_release_anchor_gate_ = gate;
+}
+
 void Runtime::set_audit_backend(AuditBackend* backend) {
     if (audit_backend_override_ == backend) return;
     audit_backend_override_ = backend;
@@ -519,15 +772,17 @@ OperationRef Runtime::operation_ref(const Label& label) {
 }
 
 Record* Runtime::find_operation(const OperationRef& ref) {
-    for (auto& operation : operations_)
-        if (operation_ref(operation.label) == ref) return &operation;
-    return nullptr;
+    const auto it = operation_index_.find(ref);
+    if (it == operation_index_.end() || it->second >= operations_.size())
+        return nullptr;
+    return &operations_[it->second];
 }
 
 const Record* Runtime::find_operation(const OperationRef& ref) const {
-    for (const auto& operation : operations_)
-        if (operation_ref(operation.label) == ref) return &operation;
-    return nullptr;
+    const auto it = operation_index_.find(ref);
+    if (it == operation_index_.end() || it->second >= operations_.size())
+        return nullptr;
+    return &operations_[it->second];
 }
 
 CheckpointRecord& Runtime::ensure_checkpoint(Phase phase, uint32_t round) {
@@ -541,32 +796,43 @@ CheckpointRecord& Runtime::ensure_checkpoint(Phase phase, uint32_t round) {
     checkpoint.round = round;
     checkpoint.generation = generation;
     checkpoints_.push_back(checkpoint);
+    const size_t index = checkpoints_.size() - 1;
+    checkpoint_index_[checkpoint.id] = index;
+    latest_checkpoint_index_[phase_round_index_key(phase, round)] = index;
     return checkpoints_.back();
 }
 
 CheckpointRecord* Runtime::find_checkpoint(CheckpointId id) {
-    for (auto& checkpoint : checkpoints_)
-        if (checkpoint.id == id) return &checkpoint;
-    return nullptr;
+    const auto it = checkpoint_index_.find(id);
+    if (it == checkpoint_index_.end() || it->second >= checkpoints_.size())
+        return nullptr;
+    return &checkpoints_[it->second];
 }
 
 const CheckpointRecord* Runtime::find_checkpoint(CheckpointId id) const {
-    for (const auto& checkpoint : checkpoints_)
-        if (checkpoint.id == id) return &checkpoint;
-    return nullptr;
+    const auto it = checkpoint_index_.find(id);
+    if (it == checkpoint_index_.end() || it->second >= checkpoints_.size())
+        return nullptr;
+    return &checkpoints_[it->second];
 }
 
 CheckpointRecord* Runtime::find_latest_checkpoint(Phase phase, uint32_t round) {
-    for (auto it = checkpoints_.rbegin(); it != checkpoints_.rend(); ++it)
-        if (it->phase == phase && it->round == round) return &(*it);
-    return nullptr;
+    const auto it = latest_checkpoint_index_.find(
+        phase_round_index_key(phase, round));
+    if (it == latest_checkpoint_index_.end() ||
+        it->second >= checkpoints_.size())
+        return nullptr;
+    return &checkpoints_[it->second];
 }
 
 const CheckpointRecord* Runtime::find_latest_checkpoint(
     Phase phase, uint32_t round) const {
-    for (auto it = checkpoints_.rbegin(); it != checkpoints_.rend(); ++it)
-        if (it->phase == phase && it->round == round) return &(*it);
-    return nullptr;
+    const auto it = latest_checkpoint_index_.find(
+        phase_round_index_key(phase, round));
+    if (it == latest_checkpoint_index_.end() ||
+        it->second >= checkpoints_.size())
+        return nullptr;
+    return &checkpoints_[it->second];
 }
 
 CheckpointId Runtime::make_checkpoint_id(
@@ -577,19 +843,21 @@ CheckpointId Runtime::make_checkpoint_id(
 }
 
 OperationRef Runtime::latest_operation_ref(Phase phase) const {
-    for (auto it = operations_.rbegin(); it != operations_.rend(); ++it) {
-        if (it->label.phase == phase && it->active)
-            return operation_ref(it->label);
-    }
-    return OperationRef{};
+    const auto it =
+        latest_active_by_phase_.find(static_cast<uint32_t>(phase));
+    if (it == latest_active_by_phase_.end() ||
+        it->second >= operations_.size())
+        return OperationRef{};
+    return operation_ref(operations_[it->second].label);
 }
 
 OperationRef Runtime::latest_operation_ref(Phase phase, uint32_t owner) const {
-    for (auto it = operations_.rbegin(); it != operations_.rend(); ++it) {
-        if (it->label.phase == phase && it->label.owner == owner && it->active)
-            return operation_ref(it->label);
-    }
-    return OperationRef{};
+    const auto it = latest_active_by_phase_owner_.find(
+        phase_owner_index_key(phase, owner));
+    if (it == latest_active_by_phase_owner_.end() ||
+        it->second >= operations_.size())
+        return OperationRef{};
+    return operation_ref(operations_[it->second].label);
 }
 
 OperationRef Runtime::previous_round_operation_ref(
@@ -601,14 +869,8 @@ OperationRef Runtime::previous_round_operation_ref(
     if (current)
         generation = current->sealed ? current->generation + 1 : current->generation;
 
-    const CheckpointRecord* previous = nullptr;
-    for (auto it = checkpoints_.rbegin(); it != checkpoints_.rend(); ++it) {
-        if (it->phase == phase && it->round == round - 1 &&
-            it->generation == generation) {
-            previous = &(*it);
-            break;
-        }
-    }
+    const CheckpointRecord* previous = find_checkpoint(
+        make_checkpoint_id(phase, round - 1, generation));
     if (!previous) return OperationRef{};
 
     for (auto it = previous->operations.rbegin();
@@ -698,6 +960,9 @@ void Runtime::seal_checkpoint(Phase phase, uint32_t round) {
     if (audit_backend_override_)
         audit_backend_override_->OnSealCheckpoint(
             make_audit_checkpoint_view(*checkpoint));
+    if (source_observer_)
+        source_observer_->OnSealCheckpoint(
+            make_audit_checkpoint_view(*checkpoint));
 }
 
 void Runtime::seal_checkpoint_instance(Phase phase, uint32_t round) {
@@ -744,10 +1009,15 @@ RecordId Runtime::prepare_record(
     rec.debug_only = true;
 
     operations_.push_back(rec);
+    operation_index_[operation_ref(operations_.back().label)] =
+        operations_.size() - 1;
     checkpoint.operations.push_back(operation_ref(rec.label));
     checkpoint.sealed = false;
     if (audit_backend_override_)
         audit_backend_override_->OnRegisterOperation(
+            make_audit_operation_view(operations_.back()));
+    if (source_observer_)
+        source_observer_->OnRegisterOperation(
             make_audit_operation_view(operations_.back()));
 
     pending_ = rec;
@@ -768,6 +1038,20 @@ RecordId Runtime::register_vector_operation(
     if (!config_.enabled) return 0;
     const RecordId id = prepare_record(phase, round, obligation,
                                        hash_field_vector(expected), predecessors);
+    bind_private_field_operation(
+        id, AuditPrivatePayloadKind::FIELD_VECTOR,
+        AuditPayloadStage::REGISTER_INPUT, expected);
+    return id;
+}
+
+
+RecordId Runtime::register_vector_operation_prehashed(
+    Phase phase, uint32_t round, Obligation obligation,
+    const std::vector<F>& expected, const Digest& expected_digest,
+    const std::vector<OperationRef>& predecessors) {
+    if (!config_.enabled || expected_digest == Digest{}) return 0;
+    const RecordId id = prepare_record(
+        phase, round, obligation, expected_digest, predecessors);
     bind_private_field_operation(
         id, AuditPrivatePayloadKind::FIELD_VECTOR,
         AuditPayloadStage::REGISTER_INPUT, expected);
@@ -870,10 +1154,25 @@ void Runtime::activate_record(RecordId id, const Digest& actual) {
     if (Record* operation = find_operation(operation_ref(pending_.label))) {
         operation->actual = actual;
         operation->active = true;
+        const OperationRef active_ref = operation_ref(operation->label);
+        const auto active_it = operation_index_.find(active_ref);
+        if (active_it != operation_index_.end()) {
+            const size_t active_index = active_it->second;
+            auto& phase_index = latest_active_by_phase_[
+                static_cast<uint32_t>(operation->label.phase)];
+            auto& owner_index = latest_active_by_phase_owner_[
+                phase_owner_index_key(
+                    operation->label.phase, operation->label.owner)];
+            if (phase_index <= active_index) phase_index = active_index;
+            if (owner_index <= active_index) owner_index = active_index;
+        }
         if (CheckpointRecord* checkpoint = find_checkpoint(operation->checkpoint))
             checkpoint->sealed = false;
         if (audit_backend_override_)
             audit_backend_override_->OnActivateOperation(
+                make_audit_operation_view(*operation));
+        if (source_observer_)
+            source_observer_->OnActivateOperation(
                 make_audit_operation_view(*operation));
     }
 
@@ -891,7 +1190,8 @@ void Runtime::activate_record(RecordId id, const Digest& actual) {
 void Runtime::bind_private_field_operation(
     RecordId id, AuditPrivatePayloadKind kind, AuditPayloadStage stage,
     const std::vector<F>& values) {
-    if (!config_.enabled || !audit_backend_override_ || id == 0) return;
+    if (!config_.enabled ||
+        (!audit_backend_override_ && !source_observer_) || id == 0) return;
     OperationRef ref;
     ref.owner = static_cast<uint32_t>(rank_);
     ref.object_id = id;
@@ -902,15 +1202,20 @@ void Runtime::bind_private_field_operation(
         operation->private_input_bound = true;
     else
         operation->private_output_bound = true;
-    audit_backend_override_->OnBindPrivateFieldOperation(
-        make_audit_operation_view(*operation), kind, stage, values);
+    if (audit_backend_override_)
+        audit_backend_override_->OnBindPrivateFieldOperation(
+            make_audit_operation_view(*operation), kind, stage, values);
+    if (source_observer_)
+        source_observer_->OnBindPrivateFieldOperation(
+            make_audit_operation_view(*operation), kind, stage, values);
     if (stage == AuditPayloadStage::ACTIVATE_OUTPUT)
         maybe_finalize_private_relation(id);
 }
 
 void Runtime::bind_private_word_operation(
     RecordId id, AuditPayloadStage stage, const std::vector<u64>& values) {
-    if (!config_.enabled || !audit_backend_override_ || id == 0) return;
+    if (!config_.enabled ||
+        (!audit_backend_override_ && !source_observer_) || id == 0) return;
     OperationRef ref;
     ref.owner = static_cast<uint32_t>(rank_);
     ref.object_id = id;
@@ -921,14 +1226,19 @@ void Runtime::bind_private_word_operation(
         operation->private_input_bound = true;
     else
         operation->private_output_bound = true;
-    audit_backend_override_->OnBindPrivateWordOperation(
-        make_audit_operation_view(*operation), stage, values);
+    if (audit_backend_override_)
+        audit_backend_override_->OnBindPrivateWordOperation(
+            make_audit_operation_view(*operation), stage, values);
+    if (source_observer_)
+        source_observer_->OnBindPrivateWordOperation(
+            make_audit_operation_view(*operation), stage, values);
     if (stage == AuditPayloadStage::ACTIVATE_OUTPUT)
         maybe_finalize_private_relation(id);
 }
 
 void Runtime::maybe_finalize_private_relation(RecordId id) {
-    if (!config_.enabled || !audit_backend_override_ || id == 0) return;
+    if (!config_.enabled ||
+        (!audit_backend_override_ && !source_observer_) || id == 0) return;
     OperationRef ref;
     ref.owner = static_cast<uint32_t>(rank_);
     ref.object_id = id;
@@ -938,14 +1248,29 @@ void Runtime::maybe_finalize_private_relation(RecordId id) {
         !operation->private_output_bound || operation->private_relation_finalized)
         return;
     operation->private_relation_finalized = true;
-    audit_backend_override_->OnFinalizePrivateRelation(
-        make_audit_operation_view(*operation));
+    if (audit_backend_override_)
+        audit_backend_override_->OnFinalizePrivateRelation(
+            make_audit_operation_view(*operation));
+    if (source_observer_)
+        source_observer_->OnFinalizePrivateRelation(
+            make_audit_operation_view(*operation));
 }
 
 void Runtime::activate_vector(RecordId id,
                               const std::vector<F>& actual) {
     if (!config_.enabled) return;
     activate_record(id, hash_field_vector(actual));
+    bind_private_field_operation(
+        id, AuditPrivatePayloadKind::FIELD_VECTOR,
+        AuditPayloadStage::ACTIVATE_OUTPUT, actual);
+}
+
+
+void Runtime::activate_vector_prehashed(
+    RecordId id, const std::vector<F>& actual,
+    const Digest& actual_digest) {
+    if (!config_.enabled || actual_digest == Digest{}) return;
+    activate_record(id, actual_digest);
     bind_private_field_operation(
         id, AuditPrivatePayloadKind::FIELD_VECTOR,
         AuditPayloadStage::ACTIVATE_OUTPUT, actual);
@@ -971,16 +1296,17 @@ void Runtime::bind_state_dependencies(
     operation->state_dependency_evidence.clear();
     operation->state_dependency_evidence_complete = true;
     for (StateId state_id : state_ids) {
-        const auto it = std::find_if(states_.begin(), states_.end(),
-            [&](const StateRecord& state) { return state.id == state_id; });
-        if (it == states_.end()) {
+        const auto state_it = state_index_.find(state_id);
+        if (state_it == state_index_.end() ||
+            state_it->second >= states_.size()) {
             operation->state_dependency_evidence_complete = false;
             continue;
         }
+        const StateRecord& state = states_[state_it->second];
         StateDependencyEvidence evidence;
-        evidence.owner = it->label.owner;
-        evidence.state_id = it->id;
-        evidence.digest = it->digest;
+        evidence.owner = state.label.owner;
+        evidence.state_id = state.id;
+        evidence.digest = state.digest;
         operation->state_dependency_evidence.push_back(evidence);
     }
     operation->declared_state_dependency_count =
@@ -1000,9 +1326,13 @@ void Runtime::bind_state_dependencies(
         checkpoint->sealed = false;
     if (pending_valid_ && pending_.id == id) pending_ = *operation;
 
-    if (audit_backend_override_) {
-        audit_backend_override_->OnBindOperationStateDependencies(
-            make_audit_operation_view(*operation), state_ids);
+    if (audit_backend_override_ || source_observer_) {
+        if (audit_backend_override_)
+            audit_backend_override_->OnBindOperationStateDependencies(
+                make_audit_operation_view(*operation), state_ids);
+        if (source_observer_)
+            source_observer_->OnBindOperationStateDependencies(
+                make_audit_operation_view(*operation), state_ids);
         maybe_finalize_private_relation(id);
     }
 }
@@ -1087,14 +1417,18 @@ void Runtime::bind_public_field_aux(
     RecordId id, AuditPublicAuxKind kind, const std::vector<F>& values) {
     if (!config_.enabled) return;
     bind_public_aux_digest(id, kind, hash_field_vector(values));
-    if (!audit_backend_override_) return;
+    if (!audit_backend_override_ && !source_observer_) return;
     OperationRef ref;
     ref.owner = static_cast<uint32_t>(rank_);
     ref.object_id = id;
     const Record* operation = find_operation(ref);
     if (!operation) return;
-    audit_backend_override_->OnBindPublicFieldAux(
-        make_audit_operation_view(*operation), kind, values);
+    if (audit_backend_override_)
+        audit_backend_override_->OnBindPublicFieldAux(
+            make_audit_operation_view(*operation), kind, values);
+    if (source_observer_)
+        source_observer_->OnBindPublicFieldAux(
+            make_audit_operation_view(*operation), kind, values);
     maybe_finalize_private_relation(id);
 }
 
@@ -1102,14 +1436,18 @@ void Runtime::bind_public_word_aux(
     RecordId id, AuditPublicAuxKind kind, const std::vector<u64>& values) {
     if (!config_.enabled) return;
     bind_public_aux_digest(id, kind, hash_words(values));
-    if (!audit_backend_override_) return;
+    if (!audit_backend_override_ && !source_observer_) return;
     OperationRef ref;
     ref.owner = static_cast<uint32_t>(rank_);
     ref.object_id = id;
     const Record* operation = find_operation(ref);
     if (!operation) return;
-    audit_backend_override_->OnBindPublicWordAux(
-        make_audit_operation_view(*operation), kind, values);
+    if (audit_backend_override_)
+        audit_backend_override_->OnBindPublicWordAux(
+            make_audit_operation_view(*operation), kind, values);
+    if (source_observer_)
+        source_observer_->OnBindPublicWordAux(
+            make_audit_operation_view(*operation), kind, values);
     maybe_finalize_private_relation(id);
 }
 
@@ -1166,8 +1504,14 @@ void Runtime::activate_cubic(RecordId id,
 std::array<u64, META_WORDS>
 Runtime::make_pending_meta(
     const std::vector<u64>& payload, bool seal) const {
+    return make_pending_meta_digest(hash_words(payload), seal);
+}
+
+std::array<u64, META_WORDS>
+Runtime::make_pending_meta_digest(
+    const Digest& payload_digest, bool seal) const {
     std::array<u64, META_WORDS> meta{};
-    const Digest payload_digest = hash_words(payload);
+    if (payload_digest == Digest{}) return meta;
 
     meta[0] = META_MAGIC;
     meta[1] = config_.session_id;
@@ -1244,7 +1588,8 @@ Runtime::make_pending_meta(
         const Digest empty_state_root = compute_state_dependency_root({});
         digest_to_words(empty_state_root, &meta[META_STATE_DEP_ROOT_OFFSET]);
     }
-    if (config_.enabled && seal) seal_transfer_meta(meta, payload);
+    if (config_.enabled && seal)
+        seal_transfer_meta_digest(meta, payload_digest);
     return meta;
 }
 
@@ -1253,8 +1598,16 @@ Runtime::make_direct_meta(Phase phase, uint32_t round,
                           Obligation obligation, uint64_t object_id,
                           const std::vector<u64>& payload,
                           bool seal) const {
+    return make_direct_meta_digest(
+        phase, round, obligation, object_id, hash_words(payload), seal);
+}
+
+std::array<u64, META_WORDS>
+Runtime::make_direct_meta_digest(
+    Phase phase, uint32_t round, Obligation obligation, uint64_t object_id,
+    const Digest& payload_digest, bool seal) const {
     std::array<u64, META_WORDS> meta{};
-    const Digest payload_digest = hash_words(payload);
+    if (payload_digest == Digest{}) return meta;
     meta[0] = META_MAGIC;
     meta[1] = config_.session_id;
     meta[2] = static_cast<u64>(phase);
@@ -1299,7 +1652,7 @@ Runtime::make_direct_meta(Phase phase, uint32_t round,
                 static_cast<u64>(predecessor->label.obligation);
         }
     }
-    if (config_.enabled && seal) seal_transfer_meta(meta, payload);
+    if (config_.enabled && seal) seal_transfer_meta_digest(meta, payload_digest);
     return meta;
 }
 
@@ -1311,6 +1664,16 @@ bool Runtime::seal_transfer_meta(
         ExperimentDurationKind::TRANSFER_METADATA_SEAL);
     return Ed25519TransferAuthenticator::instance().Seal(
         &meta, wire_payload);
+}
+
+bool Runtime::seal_transfer_meta_digest(
+    std::array<u64, META_WORDS>& meta,
+    const Digest& wire_digest) const {
+    if (!config_.enabled || wire_digest == Digest{}) return false;
+    ExperimentDurationScope metrics_scope(
+        ExperimentDurationKind::TRANSFER_METADATA_SEAL);
+    return Ed25519TransferAuthenticator::instance().SealDigest(
+        &meta, wire_digest);
 }
 
 void Runtime::register_observed_operation(
@@ -1407,6 +1770,21 @@ void Runtime::register_observed_operation(
         existing->actual = words_to_digest(&meta[8]);
         existing->active = (meta[7] & 1ULL) != 0;
         existing->observed_remote = existing->observed_remote || observed_remote;
+        if (existing->active) {
+            const auto existing_it = operation_index_.find(ref);
+            if (existing_it != operation_index_.end()) {
+                const size_t existing_index = existing_it->second;
+                auto& phase_index = latest_active_by_phase_[
+                    static_cast<uint32_t>(existing->label.phase)];
+                auto& owner_index = latest_active_by_phase_owner_[
+                    phase_owner_index_key(
+                        existing->label.phase, existing->label.owner)];
+                if (phase_index <= existing_index)
+                    phase_index = existing_index;
+                if (owner_index <= existing_index)
+                    owner_index = existing_index;
+            }
+        }
         if (v2) apply_declared_dependency(*existing);
         existing->relation = relation_for_obligation(existing->label.obligation);
         existing->relation_statement = compute_relation_statement(
@@ -1450,6 +1828,18 @@ void Runtime::register_observed_operation(
     record.active = (meta[7] & 1ULL) != 0;
     record.observed_remote = observed_remote;
     operations_.push_back(record);
+    operation_index_[operation_ref(operations_.back().label)] =
+        operations_.size() - 1;
+    if (record.active) {
+        const size_t new_index = operations_.size() - 1;
+        auto& phase_index = latest_active_by_phase_[
+            static_cast<uint32_t>(record.label.phase)];
+        auto& owner_index = latest_active_by_phase_owner_[
+            phase_owner_index_key(
+                record.label.phase, record.label.owner)];
+        if (phase_index <= new_index) phase_index = new_index;
+        if (owner_index <= new_index) owner_index = new_index;
+    }
     checkpoint.operations.push_back(ref);
     checkpoint.sealed = false;
     if (audit_backend_override_) {
@@ -1463,15 +1853,14 @@ void Runtime::register_observed_operation(
 
 void Runtime::observe_public_transfer(
     const std::array<u64, META_WORDS>& meta,
-    const std::vector<u64>& payload,
+    const Digest& payload_digest,
     bool remote_observation,
     int sender_override) {
     Label source_label = label_from_meta(meta);
     const OperationRef ref = operation_ref(source_label);
     const Record* operation = find_operation(ref);
     if (!operation) return;
-    if (std::find(public_transfer_refs_.begin(), public_transfer_refs_.end(), ref) ==
-        public_transfer_refs_.end())
+    if (public_transfer_ref_set_.insert(ref).second)
         public_transfer_refs_.push_back(ref);
     if (!audit_backend_override_) return;
 
@@ -1498,15 +1887,16 @@ void Runtime::observe_public_transfer(
     observation.public_aux_count =
         static_cast<uint32_t>(meta[META_PUBLIC_AUX_COUNT_INDEX]);
     observation.registered_digest = words_to_digest(&meta[8]);
-    observation.payload_digest = hash_words(payload);
+    observation.payload_digest = payload_digest;
     observation.operation_statement_binding = compute_relation_statement(
         observation.transfer_label, RelationKind::MESSAGE_BINDING,
         AuditRelationKernel::UNKNOWN, observation.registered_digest,
         observation.predecessor_root, observation.predecessor_count,
         observation.state_dependency_root, observation.state_dependency_count,
         observation.public_aux_root, observation.public_aux_count);
-    observation.metadata_binding = hash_words(
-        std::vector<u64>(meta.begin(), meta.end()));
+    observation.metadata_binding = hash_bytes(
+        reinterpret_cast<const uint8_t*>(meta.data()),
+        META_WORDS * sizeof(u64));
     observation.authenticated_metadata = meta;
     observation.remote_observation = remote_observation;
     audit_backend_override_->OnObservePublicTransfer(observation);
@@ -1515,14 +1905,26 @@ void Runtime::observe_public_transfer(
 void Runtime::observe_outgoing_transfer(
     const std::array<u64, META_WORDS>& meta,
     const std::vector<u64>& payload) {
-    if (!config_.enabled) return;
+    observe_outgoing_transfer_digest(meta, hash_words(payload));
+}
+
+void Runtime::observe_outgoing_transfer_digest(
+    const std::array<u64, META_WORDS>& meta,
+    const Digest& payload_digest) {
+    if (!config_.enabled || payload_digest == Digest{}) return;
     auto& transfer_auth = Ed25519TransferAuthenticator::instance();
-    if (!transfer_auth.ready() || !transfer_auth.Verify(meta, rank_)) return;
-    const Digest payload_digest = hash_words(payload);
+    if (!transfer_auth.ready() ||
+        meta[0] != META_MAGIC ||
+        meta[META_SCHEMA_INDEX] < 6 ||
+        meta[META_AUTH_SIGNER_INDEX] != static_cast<u64>(rank_) ||
+        meta[4] != static_cast<u64>(rank_) ||
+        words_to_digest(&meta[META_AUTH_KEY_ID_OFFSET]) !=
+            transfer_auth.PublicKeyId(static_cast<uint32_t>(rank_)))
+        return;
     if (words_to_digest(&meta[META_AUTH_WIRE_DIGEST_OFFSET]) != payload_digest)
         return;
     register_observed_operation(meta, false);
-    observe_public_transfer(meta, payload, false);
+    observe_public_transfer(meta, payload_digest, false, -1);
     update_transcript(meta);
     const Digest registered_digest = words_to_digest(&meta[8]);
     if (registered_digest != payload_digest) {
@@ -1540,18 +1942,20 @@ void Runtime::observe_direct_local(
 
 void Runtime::update_transcript(
     const std::array<u64, META_WORDS>& meta) {
-    std::vector<uint8_t> bytes;
-    bytes.reserve(transcript_digest_.bytes.size() +
-                  META_WORDS * sizeof(u64));
-    bytes.insert(bytes.end(), transcript_digest_.bytes.begin(),
-                 transcript_digest_.bytes.end());
-
-    const uint8_t* meta_bytes =
-        reinterpret_cast<const uint8_t*>(meta.data());
-    bytes.insert(bytes.end(), meta_bytes,
-                 meta_bytes + META_WORDS * sizeof(u64));
-
-    transcript_digest_ = hash_bytes(bytes.data(), bytes.size());
+    // Byte-for-byte equivalent to hashing
+    // transcript_digest || canonical_metadata, but without allocating and
+    // copying a temporary buffer for every observed transfer.
+    blake3_hasher hasher;
+    blake3_hasher_init(&hasher);
+    blake3_hasher_update(
+        &hasher, transcript_digest_.bytes.data(),
+        transcript_digest_.bytes.size());
+    blake3_hasher_update(
+        &hasher, reinterpret_cast<const uint8_t*>(meta.data()),
+        META_WORDS * sizeof(u64));
+    blake3_hasher_finalize(
+        &hasher, transcript_digest_.bytes.data(),
+        transcript_digest_.bytes.size());
     ++transcript_records_;
 }
 
@@ -1605,19 +2009,30 @@ void Runtime::record_pending_relation_violation() {
 
 void Runtime::observe_local_payload(const std::vector<u64>& payload) {
     if (!config_.enabled) return;
+    observe_local_payload_digest(hash_words(payload));
+}
+
+void Runtime::observe_local_payload_digest(const Digest& payload_digest) {
+    if (!config_.enabled || payload_digest == Digest{}) return;
     // Local transcript observation does not cross a trust boundary; avoid
-    // an Ed25519 signature that would never be transmitted.
-    const auto meta = make_pending_meta(payload, false);
-    observe_local_meta(meta, payload);
+    // both a signature and materializing a wire-format copy when the caller
+    // already has the canonical digest.
+    const auto meta = make_pending_meta_digest(payload_digest, false);
+    observe_local_meta_digest(meta, payload_digest);
 }
 
 void Runtime::observe_local_meta(
     const std::array<u64, META_WORDS>& meta,
     const std::vector<u64>& payload) {
-    if (!config_.enabled || meta[0] != META_MAGIC ||
-        meta[1] != config_.session_id)
+    observe_local_meta_digest(meta, hash_words(payload));
+}
+
+void Runtime::observe_local_meta_digest(
+    const std::array<u64, META_WORDS>& meta,
+    const Digest& payload_digest) {
+    if (!config_.enabled || payload_digest == Digest{} ||
+        meta[0] != META_MAGIC || meta[1] != config_.session_id)
         return;
-    const Digest payload_digest = hash_words(payload);
     const Digest actual = words_to_digest(&meta[8]);
     const Digest expected = words_to_digest(&meta[12]);
 
@@ -1637,11 +2052,17 @@ void Runtime::observe_local_meta(
 bool Runtime::strict_remote_transfer_valid(
     int sender, const std::array<u64, META_WORDS>& meta,
     const std::vector<u64>& payload) const {
+    return strict_remote_transfer_valid_digest(
+        sender, meta, hash_words(payload));
+}
+
+bool Runtime::strict_remote_transfer_valid_digest(
+    int sender, const std::array<u64, META_WORDS>& meta,
+    const Digest& payload_digest) const {
     if (!config_.enabled) return true;
-    if (meta[0] != META_MAGIC) return false;
+    if (meta[0] != META_MAGIC || payload_digest == Digest{}) return false;
     auto& transfer_auth = Ed25519TransferAuthenticator::instance();
     if (!transfer_auth.ready() || !transfer_auth.Verify(meta, sender)) return false;
-    const Digest payload_digest = hash_words(payload);
     const Digest signed_wire_digest =
         words_to_digest(&meta[META_AUTH_WIRE_DIGEST_OFFSET]);
     if (signed_wire_digest != payload_digest) return false;
@@ -1652,13 +2073,33 @@ bool Runtime::strict_remote_transfer_valid(
         return false;
     const Digest actual = words_to_digest(&meta[8]);
     const Digest expected = words_to_digest(&meta[12]);
-    return expected == actual && payload_digest == actual;
+    const bool valid =
+        expected == actual && payload_digest == actual;
+    if (valid) {
+        verified_transfer_cache_sender_ = sender;
+        verified_transfer_cache_meta_digest_ = hash_bytes(
+            reinterpret_cast<const uint8_t*>(meta.data()),
+            META_WORDS * sizeof(u64));
+        verified_transfer_cache_payload_digest_ = payload_digest;
+        verified_transfer_cache_valid_ =
+            verified_transfer_cache_meta_digest_ != Digest{};
+    } else {
+        verified_transfer_cache_valid_ = false;
+    }
+    return valid;
 }
 
 void Runtime::observe_remote_meta(
     int sender,
     const std::array<u64, META_WORDS>& meta,
     const std::vector<u64>& payload) {
+    observe_remote_meta_digest(sender, meta, hash_words(payload));
+}
+
+void Runtime::observe_remote_meta_digest(
+    int sender,
+    const std::array<u64, META_WORDS>& meta,
+    const Digest& payload_digest) {
     if (!config_.enabled) return;
     ExperimentDurationScope observe_metrics_scope(
         ExperimentDurationKind::TRANSFER_METADATA_OBSERVE);
@@ -1672,8 +2113,22 @@ void Runtime::observe_remote_meta(
     }
 
     auto& transfer_auth = Ed25519TransferAuthenticator::instance();
+    if (payload_digest == Digest{}) return;
+    const Digest meta_digest = hash_bytes(
+        reinterpret_cast<const uint8_t*>(meta.data()),
+        META_WORDS * sizeof(u64));
+
     bool authenticated_metadata = false;
-    {
+    if (verified_transfer_cache_valid_ &&
+        verified_transfer_cache_sender_ == sender &&
+        verified_transfer_cache_meta_digest_ == meta_digest &&
+        verified_transfer_cache_payload_digest_ == payload_digest) {
+        authenticated_metadata = true;
+        // Consume the cache entry.  A later replay of identical bytes must
+        // still pass the ordinary authentication/replay path.
+        verified_transfer_cache_valid_ = false;
+    } else {
+        verified_transfer_cache_valid_ = false;
         ExperimentDurationScope verify_metrics_scope(
             ExperimentDurationKind::TRANSFER_METADATA_VERIFY);
         authenticated_metadata =
@@ -1687,7 +2142,7 @@ void Runtime::observe_remote_meta(
     }
     const Digest signed_wire_digest =
         words_to_digest(&meta[META_AUTH_WIRE_DIGEST_OFFSET]);
-    if (signed_wire_digest != hash_words(payload)) {
+    if (signed_wire_digest != payload_digest) {
         if (config_.verbose)
             std::cout << "[PVIA] rejecting transfer whose payload is not covered by sender signature from rank "
                       << sender << "\n";
@@ -1697,9 +2152,9 @@ void Runtime::observe_remote_meta(
     Label label = label_from_meta(meta);
     const Digest actual = words_to_digest(&meta[8]);
     const Digest expected = words_to_digest(&meta[12]);
-    const Digest payload_digest = hash_words(payload);
 
-    observe_public_transfer(meta, payload, true, sender);
+    observe_public_transfer(
+        meta, payload_digest, true, sender);
     update_transcript(meta);
 
     if (label.sid != config_.session_id ||
@@ -1777,6 +2232,8 @@ void Runtime::record_public_vector_violation(
         record.predecessor_evidence_complete = true;
         record.active = true;
         operations_.push_back(record);
+        operation_index_[operation_ref(operations_.back().label)] =
+            operations_.size() - 1;
         checkpoint.operations.push_back(ref);
         checkpoint.sealed = false;
         if (audit_backend_override_) {
@@ -1886,8 +2343,8 @@ ObligationSet Runtime::scope_for_check(const char* check_name, Phase phase,
                     (relation_lane == AuditScopeLane::PUBLIC_TRANSFER ||
                      relation_lane == AuditScopeLane::PRIVATE_AND_TRANSFER);
                 const bool observed_transfer = transfer_requested &&
-                    std::find(public_transfer_refs_.begin(), public_transfer_refs_.end(), ref) !=
-                    public_transfer_refs_.end();
+                    public_transfer_ref_set_.find(ref) !=
+                    public_transfer_ref_set_.end();
                 if (private_selected)
                     scope.private_operations.push_back(ref);
                 if (explicit_transfer || observed_transfer)
@@ -2165,15 +2622,203 @@ void Runtime::mark_resolved(const Violation& violation) {
     }
 }
 
+void Runtime::begin_private_residual_provenance_gate(
+    uint32_t expected_round) {
+    if (!require_private_residual_provenance_) return;
+    private_residual_expected_round_ = expected_round;
+    private_residual_provenance_gate_started_ = true;
+    private_residual_source_bound_ = false;
+    private_residual_provenance_authorized_ = false;
+    private_residual_statement_binding_ = Digest{};
+    private_residual_computation_binding_ = Digest{};
+    private_residual_check_transcript_binding_ = Digest{};
+    private_residual_issuer_id_ = 0;
+    private_residual_minimum_sequence_ = 0;
+    private_residual_provenance_release_consumed_ = false;
+    private_residual_provenance_consumed_round_ = 0;
+}
+
+bool Runtime::bind_private_residual_provenance_source(
+    const Digest& statement_binding,
+    const Digest& computation_binding) {
+    if (!require_private_residual_provenance_) return true;
+    if (!config_.enabled || !private_residual_provenance_gate_started_ ||
+        private_residual_source_bound_ ||
+        private_residual_provenance_authorized_ ||
+        statement_binding == Digest{} || computation_binding == Digest{})
+        return false;
+    private_residual_statement_binding_ = statement_binding;
+    private_residual_computation_binding_ = computation_binding;
+    private_residual_source_bound_ = true;
+    return true;
+}
+
+bool Runtime::authorize_private_residual_provenance(
+    const Digest& statement_binding,
+    const Digest& computation_binding,
+    const Digest& check_transcript_binding,
+    uint64_t issuer_id, uint64_t minimum_accepted_sequence) {
+    if (!require_private_residual_provenance_) return true;
+    if (!config_.enabled || !private_residual_provenance_gate_started_ ||
+        !private_residual_source_bound_ ||
+        private_residual_statement_binding_ == Digest{} ||
+        private_residual_computation_binding_ == Digest{} ||
+        statement_binding != private_residual_statement_binding_ ||
+        computation_binding != private_residual_computation_binding_ ||
+        check_transcript_binding == Digest{} ||
+        issuer_id == 0 || minimum_accepted_sequence == 0)
+        return false;
+    private_residual_check_transcript_binding_ = check_transcript_binding;
+    private_residual_issuer_id_ = issuer_id;
+    private_residual_minimum_sequence_ = minimum_accepted_sequence;
+    private_residual_provenance_authorized_ = true;
+    return true;
+}
+
+bool Runtime::private_residual_provenance_release_gate(
+    const char* release_name) const {
+    if (!require_private_residual_provenance_) return true;
+    const bool expected_release = release_name &&
+        std::string(release_name) ==
+            "folded_codeword_merkle_commitment";
+    const bool allowed = config_.enabled && expected_release &&
+        private_residual_provenance_gate_started_ &&
+        private_residual_provenance_authorized_ &&
+        private_residual_statement_binding_ != Digest{} &&
+        private_residual_computation_binding_ != Digest{} &&
+        private_residual_check_transcript_binding_ != Digest{} &&
+        private_residual_issuer_id_ != 0 &&
+        private_residual_minimum_sequence_ != 0;
+    if (rank_ == 0) {
+        std::cout << "[PVIA][residual-provenance-release-gate] "
+                  << (allowed ? "ALLOW" : "WITHHOLD")
+                  << " release="
+                  << (release_name ? release_name : "unnamed")
+                  << " gate_started="
+                  << (private_residual_provenance_gate_started_ ? "true" : "false")
+                  << " authenticated="
+                  << (private_residual_provenance_authorized_ ? "true" : "false")
+                  << " transcript_bound="
+                  << (private_residual_check_transcript_binding_ != Digest{} ? "true" : "false")
+                  << "\n";
+    }
+    return allowed;
+}
+
 bool Runtime::pre_release_gate(const char* release_name,
                                Phase phase, uint32_t round) {
-    if (!config_.enabled) return true;
+    const auto external_anchor_allows = [&]() {
+        if (!external_release_anchor_required_) return true;
+        const std::string label = release_name ? release_name : "unnamed";
+        std::vector<u64> context_words = {
+            0x5056494152454c47ULL, config_.session_id,
+            static_cast<u64>(static_cast<uint32_t>(phase)),
+            static_cast<u64>(round), transcript_records_,
+            static_cast<u64>(label.size())};
+        for (size_t offset = 0; offset < transcript_digest_.bytes.size();
+             offset += sizeof(u64)) {
+            u64 word = 0;
+            std::memcpy(&word, transcript_digest_.bytes.data() + offset,
+                        sizeof(word));
+            context_words.push_back(word);
+        }
+        for (size_t offset = 0; offset < label.size(); offset += sizeof(u64)) {
+            u64 word = 0;
+            const size_t count = std::min(sizeof(u64), label.size() - offset);
+            for (size_t i = 0; i < count; ++i)
+                word |= static_cast<u64>(
+                    static_cast<unsigned char>(label[offset + i])) << (8 * i);
+            context_words.push_back(word);
+        }
+        const Digest release_context = hash_words(context_words);
+        int collective_allow = 0;
+        if (rank_ == 0 && external_release_anchor_gate_) {
+            try {
+                collective_allow = external_release_anchor_gate_(
+                    label.c_str(), phase, round, release_context) ? 1 : 0;
+            } catch (...) {
+                collective_allow = 0;
+            }
+        }
+        if (MPI_Bcast(&collective_allow, 1, MPI_INT, 0,
+                      MPI_COMM_WORLD) != MPI_SUCCESS)
+            collective_allow = 0;
+        if (rank_ == 0) {
+            std::cout << "[PVIA][external-release-anchor-gate] "
+                      << (collective_allow ? "ALLOW" : "WITHHOLD")
+                      << " release=" << label
+                      << " phase=" << static_cast<uint32_t>(phase)
+                      << " round=" << round << "\n";
+        }
+        return collective_allow == 1;
+    };
+
+    // After a successful strict release, block any second FOLD release in
+    // the same round, but allow later protocol phases to use their own gates.
+    if (require_private_residual_provenance_ &&
+        private_residual_provenance_release_consumed_ &&
+        phase == Phase::FOLD &&
+        round == private_residual_provenance_consumed_round_) {
+        if (rank_ == 0)
+            std::cout << "[PVIA][residual-provenance-release-gate] "
+                      << "WITHHOLD release="
+                      << (release_name ? release_name : "unnamed")
+                      << " reason=fold-release-already-consumed\n";
+        return false;
+    }
+    // Strict provenance is a prerequisite, not an optional audit feature:
+    // disabling the general PVIA diagnostics must never turn a pending
+    // provenance decision into an implicit allow.
+    if (require_private_residual_provenance_ &&
+        private_residual_provenance_gate_started_) {
+        if (phase != Phase::FOLD ||
+            round != private_residual_expected_round_) {
+            if (rank_ == 0)
+                std::cout << "[PVIA][residual-provenance-release-gate] "
+                          << "WITHHOLD release="
+                          << (release_name ? release_name : "unnamed")
+                          << " reason=scope-mismatch expected_phase="
+                          << static_cast<uint32_t>(Phase::FOLD)
+                          << " expected_round=" << private_residual_expected_round_
+                          << " actual_phase=" << static_cast<uint32_t>(phase)
+                          << " actual_round=" << round << "\n";
+            return false;
+        }
+        if (!private_residual_provenance_release_gate(release_name))
+            return false;
+        // Authorization is a one-shot capability for the exact Merkle commitment
+        // release. Do not let it authorize duplicate or unrelated release
+        // points in the same FOLD epoch.
+        private_residual_provenance_authorized_ = false;
+        private_residual_source_bound_ = false;
+        private_residual_statement_binding_ = Digest{};
+        private_residual_computation_binding_ = Digest{};
+        private_residual_check_transcript_binding_ = Digest{};
+        private_residual_issuer_id_ = 0;
+        private_residual_minimum_sequence_ = 0;
+        private_residual_provenance_gate_started_ = false;
+        private_residual_provenance_release_consumed_ = true;
+        private_residual_provenance_consumed_round_ = round;
+    }
+    if (!config_.enabled) return !external_release_anchor_required_;
+    const char* capture_env =
+        std::getenv("PVIA_P105_NATIVE_SOURCE_CAPTURE");
+    const char* stop_env =
+        std::getenv("PVIA_P105_NATIVE_SOURCE_CAPTURE_STOP_AFTER_FIRST");
+    // This explicit capture-only mode observes one real native fold and exits
+    // before the proof continues. Do not use it to produce a proof result.
+    if (!require_private_residual_provenance_ &&
+        capture_env && std::string(capture_env) != "0" &&
+        stop_env && std::string(stop_env) != "0")
+        return external_anchor_allows();
     if (!audit_backend_override_) {
         if (config_.verbose && rank_ == 0)
             std::cout << "[PVIA][ReleaseGate] debug-only path; no secure backend "
-                      << "attached for phase=" << static_cast<uint32_t>(phase)
+                      << "attached for release="
+                      << (release_name ? release_name : "unnamed")
+                      << " phase=" << static_cast<uint32_t>(phase)
                       << " round=" << round << "\n";
-        return true;
+        return external_anchor_allows();
     }
 
     const char* name = release_name ? release_name : "pre-release";
@@ -2190,7 +2835,7 @@ bool Runtime::pre_release_gate(const char* release_name,
                   << " phase=" << static_cast<uint32_t>(phase)
                   << " round=" << round
                   << " result=" << (allowed ? "ALLOW" : "WITHHOLD") << "\n";
-    return allowed;
+    return allowed && external_anchor_allows();
 }
 
 bool Runtime::handle_global_failure(const char* check_name,

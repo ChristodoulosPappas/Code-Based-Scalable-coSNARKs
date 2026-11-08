@@ -1,0 +1,67 @@
+{
+  "backend": "test-only decision backend",
+  "binary_sha256": "2d2e95ac106bff52507b9305da8884d19fd91671e73510d737217ffb5a26439e",
+  "cases": {
+    "cosumcheck": {
+      "injected": "WITHHOLD",
+      "kernel": 2,
+      "phase": 3,
+      "positive": "ALLOW",
+      "release": "cosumcheck_quadratic_round_release",
+      "round": 0,
+      "scope": "BOUND",
+      "status": "PASS"
+    },
+    "distributed-sumcheck": {
+      "injected": "WITHHOLD",
+      "kernel": 4,
+      "phase": 6,
+      "positive": "ALLOW",
+      "release": "distributed_quadratic_round_release",
+      "round": 0,
+      "scope": "BOUND",
+      "status": "PASS"
+    },
+    "encoding": {
+      "injected": "WITHHOLD",
+      "kernel": 12,
+      "phase": 7,
+      "positive": "ALLOW",
+      "release": "encoding_stage2_codeword",
+      "round": 2,
+      "scope": "BOUND",
+      "status": "PASS"
+    },
+    "pcs-batch-open": {
+      "injected": "WITHHOLD",
+      "kernel": 9,
+      "phase": 5,
+      "positive": "ALLOW",
+      "release": "pcs_batch_open_round_release",
+      "round": 1,
+      "scope": "BOUND",
+      "status": "PASS"
+    },
+    "pcs-open": {
+      "injected": "WITHHOLD",
+      "kernel": 8,
+      "phase": 5,
+      "positive": "ALLOW",
+      "release": "pcs_open_round_release",
+      "round": 0,
+      "scope": "BOUND",
+      "status": "PASS"
+    }
+  },
+  "claim_scope": "release-gate wiring; NOT a cryptographic residual proof",
+  "production_private_evaluators": "NOT_ESTABLISHED",
+  "provenance_manifest_sha256": "60c80a5a94ec44f08756f93da8b9f3c2211c393737db3acaa146734357b71789",
+  "raw_log_sha256": "53b6f283b35bbbd35b92cda69fc38852f47d407661b91fb4fcf3851dd7a4a94a",
+  "repo_commit_at_preflight": "690ae7ccdc028e37ac2d1371a429acbf856700d5",
+  "repo_head_at_verification": "690ae7ccdc028e37ac2d1371a429acbf856700d5",
+  "repo_head_drift_accepted": false,
+  "schema": "pvia-release-gate-evidence/v1",
+  "script_sha256": "c6485fd2e025b4c8f047ce60029b31748aff3068a1c2e06679b5f4a46eb42711",
+  "summary_sha256": "c77a122b9b470438e585e247881c8bf0e065d1b697fd87bfaefcc3cf806ca188",
+  "verdict": "PASS_TEST_ONLY"
+}

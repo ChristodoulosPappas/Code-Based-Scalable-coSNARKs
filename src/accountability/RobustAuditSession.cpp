@@ -504,6 +504,17 @@ bool build_robust_audit_termination_from_verified_public_abort(
     return true;
 }
 
+namespace {
+bool validate_robust_audit_abort_output_impl(
+    const AuditCheckpointView& checkpoint,
+    const RobustAuditCapabilities& capabilities,
+    const RobustAuditActivation* activation,
+    const RobustAuditAbortOutput& output,
+    const Digest& expected_registry_anchor,
+    int world_size,
+    bool verify_equivocation);
+} // namespace
+
 bool build_robust_audit_abort_output_from_equivocation(
     const AuditCheckpointView& checkpoint,
     const RobustAuditCapabilities& capabilities,
@@ -537,9 +548,14 @@ bool build_robust_audit_abort_output_from_equivocation(
     candidate.abort_transcript_binding =
         compute_robust_audit_abort_transcript_binding(candidate);
     candidate.abort_binding = compute_robust_audit_abort_binding(candidate);
-    if (!validate_robust_audit_abort_output(
+    // The equivocation evidence was fully verified at function entry.
+    // Re-run all structural/transcript/binding checks on the assembled abort
+    // output, but do not repeat the same signature verification in this
+    // trusted builder call stack. Public/Judge validation still uses the
+    // full validator below.
+    if (!validate_robust_audit_abort_output_impl(
             checkpoint, capabilities, activation, candidate,
-            expected_registry_anchor, world_size))
+            expected_registry_anchor, world_size, false))
         return false;
     *output = candidate;
     return true;
@@ -662,13 +678,15 @@ bool build_robust_audit_abort_output_from_reconciled_exchange(
     return true;
 }
 
-bool validate_robust_audit_abort_output(
+namespace {
+bool validate_robust_audit_abort_output_impl(
     const AuditCheckpointView& checkpoint,
     const RobustAuditCapabilities& capabilities,
     const RobustAuditActivation* activation,
     const RobustAuditAbortOutput& output,
     const Digest& expected_registry_anchor,
-    int world_size) {
+    int world_size,
+    bool verify_equivocation) {
     if (!production_ready_identifiable_abort_capabilities(capabilities) ||
         !output.available || !output.publicly_verifiable ||
         output.stage == RobustAuditAbortStage::UNKNOWN ||
@@ -689,7 +707,8 @@ bool validate_robust_audit_abort_output(
         output.abort_transcript_binding == Digest{} ||
         output.abort_binding == Digest{})
         return false;
-    if (!verify_authenticated_mpc_equivocation_evidence(
+    if (verify_equivocation &&
+        !verify_authenticated_mpc_equivocation_evidence(
             output.equivocation, expected_registry_anchor))
         return false;
     if (output.stage == RobustAuditAbortStage::ACTIVATION) {
@@ -714,6 +733,19 @@ bool validate_robust_audit_abort_output(
         compute_robust_audit_abort_transcript_binding(output))
         return false;
     return output.abort_binding == compute_robust_audit_abort_binding(output);
+}
+} // namespace
+
+bool validate_robust_audit_abort_output(
+    const AuditCheckpointView& checkpoint,
+    const RobustAuditCapabilities& capabilities,
+    const RobustAuditActivation* activation,
+    const RobustAuditAbortOutput& output,
+    const Digest& expected_registry_anchor,
+    int world_size) {
+    return validate_robust_audit_abort_output_impl(
+        checkpoint, capabilities, activation, output,
+        expected_registry_anchor, world_size, true);
 }
 
 bool validate_robust_audit_session_output(
@@ -744,16 +776,21 @@ bool validate_robust_audit_session_output(
         return false;
     if (output.cryptographically_authenticated != capabilities.malicious_secure)
         return false;
+    if (!output.batch.available ||
+        output.batch.checkpoint != scope.checkpoint ||
+        output.batch.scope_binding != output.scope_binding ||
+        output.batch.participant_count != static_cast<size_t>(world_size) ||
+        output.batch.cryptographically_authenticated !=
+            capabilities.malicious_secure)
+        return false;
 
     if (capabilities.malicious_multiplication_consistency !=
         (output.multiplication_consistency_binding != Digest{}))
         return false;
 
     if (output.clean) {
-        if (!output.batch.available || !output.batch.ok ||
-            output.batch.checkpoint != scope.checkpoint ||
-            output.batch.scope_binding != output.scope_binding ||
-            output.violation.valid || output.recovery.available ||
+        if (!output.batch.ok || output.violation.valid ||
+            output.recovery.available ||
             output.statement.statement_binding != Digest{} ||
             output.proof.available)
             return false;
@@ -761,8 +798,8 @@ bool validate_robust_audit_session_output(
     }
 
     if (!production_ready_robust_audit_capabilities(capabilities) ||
-        !output.cryptographically_authenticated || !output.batch.available ||
-        output.batch.ok || !output.violation.valid ||
+        !output.cryptographically_authenticated || output.batch.ok ||
+        output.batch.mismatches == 0 || !output.violation.valid ||
         !output.recovery.available ||
         !output.recovery.cryptographically_authenticated ||
         output.statement.statement_binding == Digest{} ||
@@ -771,6 +808,48 @@ bool validate_robust_audit_session_output(
     if (output.violation.checkpoint != scope.checkpoint ||
         output.recovery.checkpoint != scope.checkpoint ||
         output.proof.statement_binding != output.statement.statement_binding)
+        return false;
+
+    AuditCheckpointView checkpoint;
+    checkpoint.id = scope.checkpoint;
+    checkpoint.phase = scope.phase;
+    checkpoint.round = scope.round;
+    checkpoint.generation = scope.generation;
+    checkpoint.operations = scope.operations;
+    checkpoint.root = scope.checkpoint_root;
+    checkpoint.sealed = true;
+    const AuthenticatedRecoveryRequest recovery_request =
+        make_recovery_request(output.violation, checkpoint);
+    if (recovery_request.request_binding == Digest{} ||
+        !validate_recovery_artifact(recovery_request, output.recovery))
+        return false;
+
+    RecoverableAuditShare recovered_audit;
+    recovered_audit.valid = true;
+    recovered_audit.debug_only = false;
+    recovered_audit.evidence_kind = AuditEvidenceKind::PRIVATE_RECOVERY;
+    recovered_audit.label = output.violation.label;
+    recovered_audit.relation = output.violation.relation;
+    recovered_audit.kernel = output.violation.kernel;
+    recovered_audit.expected = output.violation.expected;
+    recovered_audit.actual = output.violation.actual;
+    recovered_audit.residual_commitment =
+        output.violation.residual_commitment;
+    recovered_audit.operation_statement_binding =
+        output.violation.operation_statement_binding;
+    recovered_audit.dispute_binding = output.violation.dispute_binding;
+    recovered_audit.predecessor_root = output.recovery.predecessor_root;
+    recovered_audit.checkpoint_root = output.recovery.checkpoint_root;
+    recovered_audit.witness_digest =
+        compute_recovery_artifact_binding(output.recovery);
+    const PublicBlameStatement expected_statement =
+        make_public_blame_statement(
+            output.violation, recovered_audit, output.recovery);
+    if (expected_statement.statement_binding == Digest{} ||
+        output.statement.statement_binding !=
+            expected_statement.statement_binding ||
+        output.statement.evidence_kind != AuditEvidenceKind::PRIVATE_RECOVERY ||
+        !validate_public_blame_proof_artifact(output.statement, output.proof))
         return false;
     return true;
 }

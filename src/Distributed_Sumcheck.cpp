@@ -3,6 +3,8 @@
 #include "timer.hpp"
 #include "accountability/PVIA.hpp"
 #include "accountability/AccountableAggregation.hpp"
+#include "../Blake/blake3.h"
+#include <array>
 #include <unordered_map>
 #include <algorithm>
 #include <cstdlib>
@@ -21,19 +23,138 @@ timer com_timer;
 extern bool data_parallel;
 
 namespace {
-void enforce_distributed_sumcheck_round_release_gate(
-    const char* release_name, uint32_t round) {
+
+class CanonicalSparseStateHasher {
+public:
+    CanonicalSparseStateHasher() {
+        blake3_hasher_init(&hasher_);
+    }
+
+    void append_field(const F& value) {
+        words_[2 * used_] = value.real;
+        words_[2 * used_ + 1] = value.img;
+        ++used_;
+        if (used_ == FIELDS_PER_CHUNK) flush();
+    }
+
+    void append_fields(const std::vector<F>& values) {
+        for (const F& value : values) append_field(value);
+    }
+
+    void append_nested_fields(const std::vector<std::vector<F>>& values) {
+        for (const auto& row : values) append_fields(row);
+    }
+
+    void append_ints(const std::vector<int>& values) {
+        for (int value : values)
+            append_field(F(static_cast<long long>(value)));
+    }
+
+    pvia::Digest finalize() {
+        flush();
+        pvia::Digest out{};
+        blake3_hasher_finalize(
+            &hasher_, out.bytes.data(), out.bytes.size());
+        return out;
+    }
+
+private:
+    static constexpr size_t FIELDS_PER_CHUNK = 1024;
+
+    void flush() {
+        if (used_ == 0) return;
+        blake3_hasher_update(
+            &hasher_,
+            reinterpret_cast<const uint8_t*>(words_.data()),
+            2 * used_ * sizeof(u64));
+        used_ = 0;
+    }
+
+    blake3_hasher hasher_{};
+    std::array<u64, 2 * FIELDS_PER_CHUNK> words_{};
+    size_t used_ = 0;
+};
+
+pvia::Digest hash_sparse_eval_source_stream(
+    const std::vector<std::vector<F>>& beta1,
+    const std::vector<std::vector<F>>& beta2,
+    const std::vector<sparse_eval_data>& data) {
+    CanonicalSparseStateHasher hasher;
+    hasher.append_nested_fields(beta1);
+    hasher.append_nested_fields(beta2);
+    for (const auto& item : data) {
+        hasher.append_ints(item.IDX1);
+        hasher.append_ints(item.RD1);
+        hasher.append_ints(item.WR1);
+        hasher.append_ints(item.IDX2);
+        hasher.append_ints(item.RD2);
+        hasher.append_ints(item.WR2);
+        hasher.append_ints(item.FINAL_FR1);
+        hasher.append_ints(item.FINAL_FR2);
+    }
+    return hasher.finalize();
+}
+
+void enforce_named_aggregate_release_gate(
+    const char* release_name, pvia::Phase phase, uint32_t round) {
     auto& rt = pvia::Runtime::instance();
     if (!rt.enabled()) return;
-    if (rt.pre_release_gate(
-            release_name, pvia::Phase::DISTRIBUTED_SUMCHECK, round))
+    if (rt.pre_release_gate(release_name, phase, round))
         return;
-    rt.handle_global_failure(
-        release_name, pvia::Phase::DISTRIBUTED_SUMCHECK, round);
+    rt.handle_global_failure(release_name, phase, round);
     std::exit(15);
 }
+
+bool pvia_linear_pair_check_value(
+    const std::vector<F>& values, size_t pair, const F& x, F* out) {
+    if (!out || 2 * pair + 1 >= values.size()) return false;
+    *out = values[2 * pair] + x * (values[2 * pair + 1] - values[2 * pair]);
+    return true;
+}
+
+bool pvia_verify_distributed_quadratic(
+    const quadratic_poly& poly, const std::vector<F>& v1,
+    const std::vector<F>& v2, size_t pair_count) {
+    if (2 * pair_count > v1.size() || 2 * pair_count > v2.size()) return false;
+    const F points[] = {F(0), F(1), F(2)};
+    for (const F& x : points) {
+        F expected(0);
+        for (size_t j = 0; j < pair_count; ++j) {
+            F a(0), b(0);
+            if (!pvia_linear_pair_check_value(v1, j, x, &a) ||
+                !pvia_linear_pair_check_value(v2, j, x, &b)) return false;
+            expected += a * b;
+        }
+        if (poly.eval(x) != expected) return false;
+    }
+    return true;
+}
+
+bool pvia_verify_distributed_cubic(
+    const cubic_poly& poly, const std::vector<F>& v1,
+    const std::vector<F>& v2, const std::vector<F>& v3,
+    size_t pair_count) {
+    if (2 * pair_count > v1.size() || 2 * pair_count > v2.size() ||
+        2 * pair_count > v3.size()) return false;
+    const F points[] = {F(0), F(1), F(2), F(3)};
+    for (const F& x : points) {
+        F expected(0);
+        for (size_t j = 0; j < pair_count; ++j) {
+            F a(0), b(0), c(0);
+            if (!pvia_linear_pair_check_value(v1, j, x, &a) ||
+                !pvia_linear_pair_check_value(v2, j, x, &b) ||
+                !pvia_linear_pair_check_value(v3, j, x, &c)) return false;
+            expected += a * b * c;
+        }
+        if (poly.eval(x) != expected) return false;
+    }
+    return true;
+}
+
 } // namespace
-vector<F> aggregate_quadratic_poly_sparrow(vector<F> H, int N, const char* release_name = nullptr){
+vector<F> aggregate_quadratic_poly_sparrow(
+    vector<F> H, int N, const char* release_name,
+    pvia::Phase gate_phase, uint32_t gate_round){
     int rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     vector<F> buff;
@@ -82,8 +203,8 @@ vector<F> aggregate_quadratic_poly_sparrow(vector<F> H, int N, const char* relea
         MPI_Wait(&req,MPI_STATUS_IGNORE);
     }
     if(rank == 0) cm += (N-1)*8*buff_u64.size()/1024.0;
-    if (release_name) enforce_distributed_sumcheck_round_release_gate(
-        release_name, pvia::Runtime::instance().pending_round());
+    if (release_name) enforce_named_aggregate_release_gate(
+        release_name, gate_phase, gate_round);
     myBcast(buff_u64,N);
     if (pvia_on) pvia::publish_rank0_aggregate_meta(pvia_aggregate_meta,buff_u64,rank);
     field_vector_deserialize(buff_u64,buff);
@@ -91,7 +212,14 @@ vector<F> aggregate_quadratic_poly_sparrow(vector<F> H, int N, const char* relea
     return buff;
 }
 
-quadratic_poly aggregate_poly(quadratic_poly H, int N, const char* release_name){
+vector<F> aggregate_quadratic_poly_sparrow(
+    vector<F> H, int N, const char* release_name) {
+    return aggregate_quadratic_poly_sparrow(
+        H, N, release_name, pvia::Phase::DISTRIBUTED_SUMCHECK,
+        pvia::Runtime::instance().pending_round());
+}
+
+quadratic_poly aggregate_poly(quadratic_poly H, int N, const char* release_name, pvia::Phase gate_phase, uint32_t gate_round){
     int rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank); //get my process id
     vector<F> buff; 
@@ -153,8 +281,8 @@ quadratic_poly aggregate_poly(quadratic_poly H, int N, const char* release_name)
         MPI_Wait(&req,MPI_STATUS_IGNORE);
     }   
     if(rank == 0)cm += (N-1)*8*buff_u64.size()/1024.0;
-    if (release_name) enforce_distributed_sumcheck_round_release_gate(
-        release_name, pvia::Runtime::instance().pending_round());
+    if (release_name) enforce_named_aggregate_release_gate(
+        release_name, gate_phase, gate_round);
     myBcast(buff_u64, N);
     if (pvia_on) pvia::publish_rank0_aggregate_meta(
         pvia_aggregate_meta, buff_u64, rank);
@@ -167,7 +295,16 @@ quadratic_poly aggregate_poly(quadratic_poly H, int N, const char* release_name)
 }
 
 
-cubic_poly aggregate_poly(cubic_poly H, int N, vector<F> &v, const char* release_name = nullptr){
+quadratic_poly aggregate_poly(
+    quadratic_poly H, int N, const char* release_name) {
+    return aggregate_poly(
+        H, N, release_name, pvia::Phase::DISTRIBUTED_SUMCHECK,
+        pvia::Runtime::instance().pending_round());
+}
+
+cubic_poly aggregate_poly(
+    cubic_poly H, int N, vector<F> &v, const char* release_name,
+    pvia::Phase gate_phase, uint32_t gate_round){
     int rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank); //get my process id
     vector<F> buff; 
@@ -223,8 +360,8 @@ cubic_poly aggregate_poly(cubic_poly H, int N, vector<F> &v, const char* release
         MPI_Send(buff_u64.data(),buff_u64.size(),MPI_UINT64_T,0,0,MPI_COMM_WORLD);
     }
     if(rank == 0) cm += (N-1)*8*buff_u64.size()/1024.0;
-    if (release_name) enforce_distributed_sumcheck_round_release_gate(
-        release_name, pvia::Runtime::instance().pending_round());
+    if (release_name) enforce_named_aggregate_release_gate(
+        release_name, gate_phase, gate_round);
     myBcast(buff_u64, N);
     if (pvia_on) pvia::publish_rank0_aggregate_meta(
         pvia_aggregate_meta, buff_u64, rank);
@@ -235,6 +372,13 @@ cubic_poly aggregate_poly(cubic_poly H, int N, vector<F> &v, const char* release
     return H;
 }
 
+
+cubic_poly aggregate_poly(
+    cubic_poly H, int N, vector<F> &v, const char* release_name) {
+    return aggregate_poly(
+        H, N, v, release_name, pvia::Phase::DISTRIBUTED_SUMCHECK,
+        pvia::Runtime::instance().pending_round());
+}
 
 vector<pair<F,vector<F>>> _quadratic_sumcheck(F y, vector<F> &v1, vector<F> &v2, int N){
 	//int offset = 4;
@@ -265,6 +409,13 @@ vector<pair<F,vector<F>>> _quadratic_sumcheck(F y, vector<F> &v1, vector<F> &v2,
 
             vector<F> input;
             pt_cp.end();
+            if (pvia::Runtime::instance().enabled() &&
+                !pvia_verify_distributed_quadratic(poly, v1, v2, static_cast<size_t>(L))) {
+                pvia::Runtime::instance().handle_global_failure(
+                    "distributed_quadratic_local_arithmetic",
+                    pvia::Phase::DISTRIBUTED_SUMCHECK, i);
+                return {};
+            }
 
             // PVIA: bind the prover-local distributed-Sumcheck polynomial
             // before aggregation, then optionally inject a real coefficient fault.
@@ -272,14 +423,11 @@ vector<pair<F,vector<F>>> _quadratic_sumcheck(F y, vector<F> &v1, vector<F> &v2,
             if (pvia::Runtime::instance().enabled()) {
                 auto& rt = pvia::Runtime::instance();
                 const size_t active_count = static_cast<size_t>(2 * L);
-                vector<F> pvia_source_state;
-                pvia_source_state.insert(pvia_source_state.end(),
-                    v1.begin(), v1.begin()+active_count);
-                pvia_source_state.insert(pvia_source_state.end(),
-                    v2.begin(), v2.begin()+active_count);
-                const pvia::StateId source_state = rt.import_state(
+                const std::vector<pvia::FieldStateSegment> pvia_source_segments = {
+                    {&v1, 0, active_count}, {&v2, 0, active_count}};
+                const pvia::StateId source_state = rt.import_state_slices(
                     "distributed_quadratic_round_input",
-                    pvia::Phase::DISTRIBUTED_SUMCHECK, pvia_source_state);
+                    pvia::Phase::DISTRIBUTED_SUMCHECK, pvia_source_segments);
                 std::vector<pvia::OperationRef> predecessors;
                 const auto predecessor = rt.previous_round_operation_ref(
                     pvia::Phase::DISTRIBUTED_SUMCHECK,
@@ -300,7 +448,9 @@ vector<pair<F,vector<F>>> _quadratic_sumcheck(F y, vector<F> &v1, vector<F> &v2,
                 pvia::Runtime::instance().activate_quadratic(pvia_record, poly);
             }
 
-            poly = aggregate_poly(poly,N, "distributed_quadratic_round_release");
+            poly = aggregate_poly(
+                poly, N, "distributed_quadratic_round_release",
+                pvia::Phase::DISTRIBUTED_SUMCHECK, static_cast<uint32_t>(i));
             pt_cp.start();
             if(rank == 0)vt.start();
             
@@ -610,15 +760,15 @@ vector<pair<F,vector<F>>> _cubic_sumcheck_sparrow(F y, vector<F> &v1, vector<F> 
             pvia::RecordId pvia_record = 0;
             if (pvia::Runtime::instance().enabled()) {
                 auto& rt = pvia::Runtime::instance();
-                vector<F> pvia_source_state = v1;
-                pvia_source_state.insert(
-                    pvia_source_state.end(), v2.begin(), v2.end());
-                pvia_source_state.insert(
-                    pvia_source_state.end(), beta2.begin(), beta2.end());
-                pvia_source_state.push_back(beta3[rank]);
-                const pvia::StateId source_state = rt.import_state(
+                const vector<F> beta3_local = {beta3[rank]};
+                const pvia::StateId source_state = rt.import_state_slices(
                     "sparrow_cubic_round_input",
-                    pvia::Phase::DISTRIBUTED_SUMCHECK, pvia_source_state);
+                    pvia::Phase::DISTRIBUTED_SUMCHECK,
+                    std::vector<pvia::FieldStateSegment>{
+                        {&v1, 0, v1.size()},
+                        {&v2, 0, v2.size()},
+                        {&beta2, 0, beta2.size()},
+                        {&beta3_local, 0, beta3_local.size()}});
                 std::vector<pvia::OperationRef> predecessors;
                 const auto predecessor = rt.previous_round_operation_ref(
                     pvia::Phase::DISTRIBUTED_SUMCHECK,
@@ -642,7 +792,9 @@ vector<pair<F,vector<F>>> _cubic_sumcheck_sparrow(F y, vector<F> &v1, vector<F> 
             }
 
             sch_com.start();
-            poly = aggregate_quadratic_poly_sparrow(poly,N, "distributed_sparrow_cubic_round_release");
+            poly = aggregate_quadratic_poly_sparrow(
+                poly, N, "distributed_sparrow_cubic_round_release",
+                pvia::Phase::DISTRIBUTED_SUMCHECK, static_cast<uint32_t>(i));
             sch_com.end();
             
             pt_cp.start();
@@ -962,12 +1114,11 @@ vector<pair<F,vector<F>>> _quadratic_sumcheck_sparrow(F y, vector<F> &v1, vector
             pvia::RecordId pvia_record = 0;
             if (pvia::Runtime::instance().enabled()) {
                 auto& rt = pvia::Runtime::instance();
-                vector<F> pvia_source_state = v1;
-                pvia_source_state.insert(
-                    pvia_source_state.end(), v2.begin(), v2.end());
-                const pvia::StateId source_state = rt.import_state(
+                const std::vector<pvia::FieldStateSegment> pvia_source_segments = {
+                    {&v1, 0, v1.size()}, {&v2, 0, v2.size()}};
+                const pvia::StateId source_state = rt.import_state_slices(
                     "sparrow_quadratic_round_input",
-                    pvia::Phase::DISTRIBUTED_SUMCHECK, pvia_source_state);
+                    pvia::Phase::DISTRIBUTED_SUMCHECK, pvia_source_segments);
                 std::vector<pvia::OperationRef> predecessors;
                 const auto predecessor = rt.previous_round_operation_ref(
                     pvia::Phase::DISTRIBUTED_SUMCHECK,
@@ -989,7 +1140,9 @@ vector<pair<F,vector<F>>> _quadratic_sumcheck_sparrow(F y, vector<F> &v1, vector
                 pvia::Runtime::instance().activate_vector(pvia_record, poly);
             }
 
-            poly = aggregate_quadratic_poly_sparrow(poly,N, "distributed_sparrow_quadratic_round_release");
+            poly = aggregate_quadratic_poly_sparrow(
+                poly, N, "distributed_sparrow_quadratic_round_release",
+                pvia::Phase::DISTRIBUTED_SUMCHECK, static_cast<uint32_t>(i));
             pt_cp.start();
         
             if(rank == 0)vt.start();
@@ -1229,22 +1382,26 @@ vector<pair<F,vector<F>>> _cubic_sumcheck(F y, vector<F> &v1, vector<F> &v2, vec
             vector<F> input;
             pt_cp.end();
 
+            if (pvia::Runtime::instance().enabled() &&
+                !pvia_verify_distributed_cubic(
+                    poly, v1, v2, v3, static_cast<size_t>(L))) {
+                pvia::Runtime::instance().handle_global_failure(
+                    "distributed_cubic_local_arithmetic",
+                    pvia::Phase::DISTRIBUTED_SUMCHECK, i);
+                return {};
+            }
             // PVIA: bind the prover-local cubic relation before the
             // weighted distributed aggregation performed by rank 0.
             pvia::RecordId pvia_record = 0;
             if (pvia::Runtime::instance().enabled()) {
                 auto& rt = pvia::Runtime::instance();
                 const size_t active_count = static_cast<size_t>(2 * L);
-                vector<F> pvia_source_state;
-                pvia_source_state.insert(pvia_source_state.end(),
-                    v1.begin(), v1.begin()+active_count);
-                pvia_source_state.insert(pvia_source_state.end(),
-                    v2.begin(), v2.begin()+active_count);
-                pvia_source_state.insert(pvia_source_state.end(),
-                    v3.begin(), v3.begin()+active_count);
-                const pvia::StateId source_state = rt.import_state(
+                const std::vector<pvia::FieldStateSegment> pvia_source_segments = {
+                    {&v1, 0, active_count}, {&v2, 0, active_count},
+                    {&v3, 0, active_count}};
+                const pvia::StateId source_state = rt.import_state_slices(
                     "distributed_cubic_round_input",
-                    pvia::Phase::DISTRIBUTED_SUMCHECK, pvia_source_state);
+                    pvia::Phase::DISTRIBUTED_SUMCHECK, pvia_source_segments);
                 std::vector<pvia::OperationRef> predecessors;
                 const auto predecessor = rt.previous_round_operation_ref(
                     pvia::Phase::DISTRIBUTED_SUMCHECK,
@@ -1265,7 +1422,9 @@ vector<pair<F,vector<F>>> _cubic_sumcheck(F y, vector<F> &v1, vector<F> &v2, vec
                 pvia::Runtime::instance().activate_cubic(pvia_record, poly);
             }
     
-            poly = aggregate_poly(poly,N,v, "distributed_cubic_round_release");
+            poly = aggregate_poly(
+                poly, N, v, "distributed_cubic_round_release",
+                pvia::Phase::DISTRIBUTED_SUMCHECK, static_cast<uint32_t>(i));
             pt_cp.start();
         
             if(rank == 0)vt.start();
@@ -1495,22 +1654,22 @@ pair<F,vector<vector<F>>> prove_product(vector<vector<F>> &input, vector<F> &out
         const auto predecessor = rt.latest_operation_ref(
             pvia::Phase::DISTRIBUTED_SUMCHECK);
         if (predecessor.object_id != 0) predecessors.push_back(predecessor);
-        vector<F> product_frontier_source;
-        if (depth > 0) {
-            product_frontier_source.insert(
-                product_frontier_source.end(),
-                in1[depth-1].begin(), in1[depth-1].end());
-            product_frontier_source.insert(
-                product_frontier_source.end(),
-                in2[depth-1].begin(), in2[depth-1].end());
-        }
-        const pvia::StateId product_source_state = rt.import_state(
-            "product_frontier_input", pvia::Phase::DISTRIBUTED_SUMCHECK,
-            product_frontier_source);
-        product_derive_record = rt.register_vector_operation(
+        const pvia::StateId product_source_state =
+            depth > 0
+                ? rt.import_state_slices(
+                    "product_frontier_input",
+                    pvia::Phase::DISTRIBUTED_SUMCHECK,
+                    std::vector<pvia::FieldStateSegment>{
+                        {&in1[depth-1], 0, in1[depth-1].size()},
+                        {&in2[depth-1], 0, in2[depth-1].size()}})
+                : 0;
+        const pvia::Digest product_frontier_digest =
+            pvia::hash_field_vector(transcript[depth-1]);
+        product_derive_record = rt.register_vector_operation_prehashed(
             pvia::Phase::DISTRIBUTED_SUMCHECK,
             static_cast<uint32_t>(depth),
-            pvia::Obligation::DERIVE, transcript[depth-1], predecessors);
+            pvia::Obligation::DERIVE, transcript[depth-1],
+            product_frontier_digest, predecessors);
         rt.bind_state_dependencies(
             product_derive_record, std::vector<pvia::StateId>{product_source_state});
         rt.bind_relation_kernel(
@@ -1519,12 +1678,11 @@ pair<F,vector<vector<F>>> prove_product(vector<vector<F>> &input, vector<F> &out
             product_derive_record, pvia::AuditPublicAuxKind::GENERIC_WORDS,
             vector<u64>{static_cast<u64>(depth),
                         static_cast<u64>(transcript[depth-1].size())});
-        pvia::Runtime::instance().activate_vector(
-            product_derive_record, transcript[depth-1]);
-        vector<u64> derive_payload;
-        field_vector_serialize(transcript[depth-1], derive_payload);
-        pvia::Runtime::instance().observe_local_payload(derive_payload);
-        pvia::Runtime::instance().consume_pending();
+        rt.activate_vector_prehashed(
+            product_derive_record, transcript[depth-1],
+            product_frontier_digest);
+        rt.observe_local_payload_digest(product_frontier_digest);
+        rt.consume_pending();
     }
 
     // Send outputs to the leader
@@ -1859,24 +2017,20 @@ void secret_share_vector(
         meta_send.resize(N*pvia::META_WORDS);
         meta_recv.resize(N*pvia::META_WORDS);
         for (int dst = 0; dst < N; ++dst) {
-            vector<u64> segment(buff_u64.begin()+dst*chunk_words,
-                                buff_u64.begin()+(dst+1)*chunk_words);
-            const uint64_t object_id = pvia::Runtime::instance().allocate_object_id();
-            auto meta = pvia::Runtime::instance().make_direct_meta(
+            const u64* segment =
+                buff_u64.data() + static_cast<size_t>(dst) * chunk_words;
+            const pvia::Digest segment_digest =
+                pvia::hash_word_span(segment, chunk_words);
+            const uint64_t object_id =
+                pvia::Runtime::instance().allocate_object_id();
+            auto meta = pvia::Runtime::instance().make_direct_meta_digest(
                 pvia::Phase::DISTRIBUTED_SUMCHECK, 0,
-                pvia::Obligation::SEND, object_id, segment, false);
-            std::copy(meta.begin(), meta.end(),
-                      meta_send.begin()+dst*pvia::META_WORDS);
-        }
-        for (int dst = 0; dst < N; ++dst) {
-            vector<u64> segment(buff_u64.begin()+dst*chunk_words,
-                                buff_u64.begin()+(dst+1)*chunk_words);
-            std::array<u64, pvia::META_WORDS> meta{};
-            std::copy(meta_send.begin()+dst*pvia::META_WORDS,
-                      meta_send.begin()+(dst+1)*pvia::META_WORDS,
-                      meta.begin());
-            pvia::Runtime::instance().seal_transfer_meta(meta, segment);
-            pvia::Runtime::instance().observe_direct_local(meta, segment);
+                pvia::Obligation::SEND, object_id,
+                segment_digest, false);
+            pvia::Runtime::instance().seal_transfer_meta_digest(
+                meta, segment_digest);
+            pvia::Runtime::instance().observe_outgoing_transfer_digest(
+                meta, segment_digest);
             std::copy(meta.begin(), meta.end(),
                       meta_send.begin()+dst*pvia::META_WORDS);
         }
@@ -1897,16 +2051,20 @@ void secret_share_vector(
     if (pvia_bound) {
         bool local_ok = true;
         for (int sender = 0; sender < N; ++sender) {
-            vector<u64> segment(buff_recv_u64.begin()+sender*chunk_words,
-                                buff_recv_u64.begin()+(sender+1)*chunk_words);
+            const u64* segment =
+                buff_recv_u64.data() +
+                static_cast<size_t>(sender) * chunk_words;
+            const pvia::Digest segment_digest =
+                pvia::hash_word_span(segment, chunk_words);
             std::array<u64, pvia::META_WORDS> meta{};
             std::copy(meta_recv.begin()+sender*pvia::META_WORDS,
                       meta_recv.begin()+(sender+1)*pvia::META_WORDS,
                       meta.begin());
-            if (!pvia::Runtime::instance().strict_remote_transfer_valid(
-                    sender, meta, segment))
+            if (!pvia::Runtime::instance().strict_remote_transfer_valid_digest(
+                    sender, meta, segment_digest))
                 local_ok = false;
-            pvia::Runtime::instance().observe_remote_meta(sender, meta, segment);
+            pvia::Runtime::instance().observe_remote_meta_digest(
+                sender, meta, segment_digest);
         }
         int local = local_ok ? 1 : 0, global = 0;
         MPI_Allreduce(&local, &global, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
@@ -2194,25 +2352,46 @@ void compute_transcript(vector<vector<F>> &Tr, vector<sparse_eval_data> &data, v
 
     if (pvia::Runtime::instance().enabled()) {
         auto& rt = pvia::Runtime::instance();
-        vector<F> sparse_source = convert2vector(beta1);
-        vector<F> beta2_flat = convert2vector(beta2);
-        sparse_source.insert(sparse_source.end(), beta2_flat.begin(), beta2_flat.end());
-        for (const auto& item : data) {
-            for (auto x : item.IDX1) sparse_source.push_back(F(x));
-            for (auto x : item.RD1) sparse_source.push_back(F(x));
-            for (auto x : item.WR1) sparse_source.push_back(F(x));
-            for (auto x : item.IDX2) sparse_source.push_back(F(x));
-            for (auto x : item.RD2) sparse_source.push_back(F(x));
-            for (auto x : item.WR2) sparse_source.push_back(F(x));
-            for (auto x : item.FINAL_FR1) sparse_source.push_back(F(x));
-            for (auto x : item.FINAL_FR2) sparse_source.push_back(F(x));
+        vector<F> sparse_source;
+        pvia::Digest sparse_source_digest{};
+        if (rt.audit_backend()) {
+            sparse_source = convert2vector(beta1);
+            vector<F> beta2_flat = convert2vector(beta2);
+            sparse_source.insert(
+                sparse_source.end(), beta2_flat.begin(), beta2_flat.end());
+            for (const auto& item : data) {
+                for (auto x : item.IDX1) sparse_source.push_back(F(x));
+                for (auto x : item.RD1) sparse_source.push_back(F(x));
+                for (auto x : item.WR1) sparse_source.push_back(F(x));
+                for (auto x : item.IDX2) sparse_source.push_back(F(x));
+                for (auto x : item.RD2) sparse_source.push_back(F(x));
+                for (auto x : item.WR2) sparse_source.push_back(F(x));
+                for (auto x : item.FINAL_FR1) sparse_source.push_back(F(x));
+                for (auto x : item.FINAL_FR2) sparse_source.push_back(F(x));
+            }
+            sparse_source_digest = pvia::hash_field_vector(sparse_source);
+        } else {
+            sparse_source_digest =
+                hash_sparse_eval_source_stream(beta1, beta2, data);
         }
-        const pvia::StateId source_state = rt.import_state(
-            "sparse_eval_source", pvia::Phase::DISTRIBUTED_SUMCHECK, sparse_source);
-        vector<F> transcript_block = convert2vector(Tr);
-        const pvia::RecordId sparse_record = rt.register_vector_operation(
-            pvia::Phase::DISTRIBUTED_SUMCHECK, 0,
-            pvia::Obligation::DERIVE, transcript_block, {});
+        const pvia::StateId source_state = rt.import_state_prehashed(
+            "sparse_eval_source", pvia::Phase::DISTRIBUTED_SUMCHECK,
+            sparse_source, sparse_source_digest);
+
+        vector<const vector<F>*> transcript_segments;
+        transcript_segments.reserve(Tr.size());
+        for (const auto& row : Tr)
+            transcript_segments.push_back(&row);
+        const pvia::Digest transcript_block_digest =
+            pvia::hash_field_segments(transcript_segments);
+        vector<F> transcript_block;
+        if (rt.audit_backend())
+            transcript_block = convert2vector(Tr);
+        const pvia::RecordId sparse_record =
+            rt.register_vector_operation_prehashed(
+                pvia::Phase::DISTRIBUTED_SUMCHECK, 0,
+                pvia::Obligation::DERIVE, transcript_block,
+                transcript_block_digest, {});
         rt.bind_state_dependencies(
             sparse_record, std::vector<pvia::StateId>{source_state});
         rt.bind_relation_kernel(
@@ -2223,10 +2402,12 @@ void compute_transcript(vector<vector<F>> &Tr, vector<sparse_eval_data> &data, v
         sparse_aux.push_back(F(N));
         rt.bind_public_field_aux(
             sparse_record, pvia::AuditPublicAuxKind::GENERIC_FIELDS, sparse_aux);
-        rt.activate_vector(sparse_record, transcript_block);
-        rt.import_state(
+        rt.activate_vector_prehashed(
+            sparse_record, transcript_block, transcript_block_digest);
+        rt.import_state_prehashed(
             "sparse_eval_transcript_block",
-            pvia::Phase::DISTRIBUTED_SUMCHECK, transcript_block);
+            pvia::Phase::DISTRIBUTED_SUMCHECK,
+            transcript_block, transcript_block_digest);
     }
 }
 
@@ -2460,6 +2641,82 @@ pair<F,vector<F>> _prove_sparse_eval_opt(F y, F a, F b, F c, vector<vector<F>> &
     }    
     */
     
+    // Optional conformance probe: capture one real quadratic local polynomial
+    // from the optimized sparse-evaluation vectors. It does not consume or
+    // mutate the protocol's Fiat-Shamir transcript.
+    const char* dsc_probe_env =
+        std::getenv("PVIA_NATIVE_SUMCHECK_DSC_QUADRATIC_PROBE");
+    if (dsc_probe_env && std::string(dsc_probe_env) != "0" &&
+        pvia::Runtime::instance().enabled()) {
+        int world_size = 0;
+        MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+        if (world_size == N && N > 0 && v1.size() == v2.size() &&
+            v1.size() >= 2 && (v1.size() % 2) == 0) {
+            const size_t active_count = v1.size();
+            const size_t pairs = active_count / 2;
+            quadratic_poly probe_poly =
+                quadratic_poly(F_ZERO, F_ZERO, F_ZERO);
+            for (size_t j = 0; j < pairs; ++j) {
+                const linear_poly l1(
+                    v1[2 * j + 1] - v1[2 * j], v1[2 * j]);
+                const linear_poly l2(
+                    v2[2 * j + 1] - v2[2 * j], v2[2 * j]);
+                probe_poly = probe_poly + (l1 * l2);
+            }
+            if (pvia_verify_distributed_quadratic(
+                    probe_poly, v1, v2, pairs)) {
+                F local_claim = F_ZERO;
+                for (size_t j = 0; j < active_count; ++j)
+                    local_claim += v1[j] * v2[j];
+                const u64 local_words[2] = {
+                    static_cast<u64>(local_claim.real),
+                    static_cast<u64>(local_claim.img)};
+                std::vector<u64> all_words(
+                    static_cast<size_t>(2 * world_size), 0);
+                MPI_Allgather(local_words, 2, MPI_UNSIGNED_LONG_LONG,
+                    all_words.data(), 2, MPI_UNSIGNED_LONG_LONG,
+                    MPI_COMM_WORLD);
+                F global_claim = F_ZERO;
+                for (int party = 0; party < world_size; ++party)
+                    global_claim += F(
+                        static_cast<long long>(all_words[2 * party]),
+                        static_cast<long long>(all_words[2 * party + 1]));
+
+                auto& rt = pvia::Runtime::instance();
+                const std::vector<pvia::FieldStateSegment> source_segments = {
+                    {&v1, 0, active_count}, {&v2, 0, active_count}};
+                const pvia::StateId source_state = rt.import_state_slices(
+                    "dsc_quadratic_native_probe_input",
+                    pvia::Phase::DISTRIBUTED_SUMCHECK, source_segments);
+                if (source_state != 0) {
+                    const pvia::RecordId record = rt.register_quadratic_operation(
+                        pvia::Phase::DISTRIBUTED_SUMCHECK, 0xFFFFFFFEu,
+                        pvia::Obligation::DERIVE, probe_poly, {});
+                    rt.bind_state_dependencies(
+                        record, std::vector<pvia::StateId>{source_state});
+                    rt.bind_relation_kernel(
+                        record, pvia::AuditRelationKernel::DSC_QUADRATIC);
+                    rt.bind_public_field_aux(
+                        record, pvia::AuditPublicAuxKind::SUMCHECK_CHALLENGE,
+                        std::vector<F>{global_claim});
+                    rt.activate_quadratic(record, probe_poly);
+                    if (rank == 0)
+                        std::cout << "[PVIA][dsc-quadratic-probe] REGISTERED "
+                                  << "source_fields=" << active_count
+                                  << " local_pairs=" << pairs << "\n";
+                } else if (rank == 0) {
+                    std::cerr << "[PVIA][dsc-quadratic-probe] FAILED state_capture\n";
+                }
+            } else if (rank == 0) {
+                std::cerr << "[PVIA][dsc-quadratic-probe] FAILED local_arithmetic\n";
+            }
+        } else if (rank == 0) {
+            std::cerr << "[PVIA][dsc-quadratic-probe] FAILED input_shape "
+                      << "world_size=" << world_size << " N=" << N
+                      << " v1=" << v1.size() << " v2=" << v2.size() << "\n";
+        }
+    }
+
     pt_cp.end();
     timer eval;
     eval.reset();

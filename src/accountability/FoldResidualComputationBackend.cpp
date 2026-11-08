@@ -131,4 +131,27 @@ PrivateResidualHandle FoldResidualComputationBackend::EvaluateKernel(
     return handle;
 }
 
+bool FoldResidualComputationBackend::AuthenticateStoredShare(
+    const OperationRef& ref,
+    const PrivateResidualShareAuthenticator& authenticator) {
+    PrivateResidualShare* current=store_.Find(ref);
+    if(!current || current->authenticated ||
+       !validate_private_residual_share(*current) ||
+       !current->computation_valid ||
+       current->computation_binding!=
+           compute_private_residual_computation_binding(*current))
+        return false;
+    PrivateResidualAuthenticationArtifact artifact{};
+    if(!authenticator.Authenticate(*current,&artifact) ||
+       artifact.scheme_id!=authenticator.SchemeId() ||
+       !validate_private_residual_authentication_artifact(*current,artifact))
+        return false;
+    PrivateResidualShare updated=*current;
+    updated.authentication=artifact;
+    updated.authentication_binding=artifact.binding;
+    updated.authenticated=true;
+    updated.commitment=compute_private_residual_share_commitment(updated);
+    return store_.Put(updated);
+}
+
 } // namespace pvia

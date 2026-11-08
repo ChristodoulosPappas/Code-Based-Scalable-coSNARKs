@@ -55,6 +55,10 @@ class ResidualMpcBackend {
 public:
     virtual ~ResidualMpcBackend() = default;
     virtual ResidualMpcCapabilities Capabilities() const = 0;
+    // Empty by default. A structurally valid capability record is not proof
+    // that the implementation is a production MPC backend. Only an audited
+    // backend may override this with a stable implementation identity.
+    virtual Digest ProductionCapabilityBinding() const { return {}; }
     virtual ResidualMpcPrecommitSecurityContext PrecommitSecurityContext(
         const ObligationSet&) const { return {}; }
     virtual bool ReadyForScope(
@@ -62,6 +66,13 @@ public:
         RobustAuditSecurityLevel required_security) const {
         return required_security == RobustAuditSecurityLevel::REFERENCE_PASSIVE &&
                residual_mpc_satisfies(Capabilities(), required_security);
+    }
+    virtual bool SupportsObliviousAudit(const ObligationSet&) const {
+        return false;
+    }
+    virtual ObliviousLocalizationPublicResult AuditObliviously(
+        const ObligationSet&, const LocalResidualBatchView&, int, int) const {
+        return {};
     }
 
     virtual CollectiveResidualCommitmentSet CommitResidualBatch(
@@ -115,6 +126,11 @@ public:
     bool ready() const;
     bool ready_for_scope(const ObligationSet& scope) const;
     ResidualMpcCapabilities capabilities() const;
+    Digest ProductionCapabilityBinding() const override;
+    bool SupportsObliviousAudit(const ObligationSet& scope) const override;
+    ObliviousLocalizationPublicResult AuditObliviously(
+        const ObligationSet& scope, const LocalResidualBatchView& local_view,
+        int rank, int world_size) const override;
 
     CollectiveResidualCommitmentSet CommitResidualBatch(
         const ObligationSet& scope,

@@ -1,6 +1,7 @@
 #include "AuthenticatedMpcExchange.hpp"
 #include "ExperimentMetrics.hpp"
 #include "AuthenticatedMpcAbortEvidence.hpp"
+#include "../../Blake/blake3.h"
 
 #include <algorithm>
 #include <array>
@@ -24,6 +25,10 @@ constexpr u64 MPC_PROTOCOL_ID = 0x4d50434155544833ULL; // MPCAUTH3
 constexpr u64 MPC_BROADCAST_OP = 0x42524f4144434153ULL; // BROADCAS
 constexpr u64 MPC_ALLGATHER_OP = 0x414c4c4741544845ULL; // ALLGATHE
 constexpr u64 MPC_SCATTER_OP = 0x5343415454455232ULL; // SCATTER2
+constexpr u64 MPC_SCATTER_BATCH_SIGNATURE_DOMAIN =
+    0x5056534342545347ULL; // PVSCBTSG
+constexpr u64 MPC_SCATTER_BATCH_ROOT_DOMAIN =
+    0x5056534342545254ULL; // PVSCBTRT
 constexpr u64 MPC_ALLTOALL_OP = 0x414c4c32414c4c32ULL; // ALL2ALL2
 constexpr u64 MPC_ALLTOALL_RECEIVER_SUMMARY_DOMAIN =
     0x5056324153554d31ULL; // PV2ASUM1
@@ -162,6 +167,23 @@ AuthenticatedMpcMessageContext alltoall_summary_subcontext(
     return context;
 }
 
+Digest payload_binding_from_words(const u64* payload, size_t count) {
+    if (!payload || count == 0) return Digest{};
+    const u64 prefix[2] = {
+        MPC_PAYLOAD_DOMAIN, static_cast<u64>(count)};
+    Digest out{};
+    blake3_hasher hasher;
+    blake3_hasher_init(&hasher);
+    blake3_hasher_update(
+        &hasher, reinterpret_cast<const uint8_t*>(prefix), sizeof(prefix));
+    blake3_hasher_update(
+        &hasher, reinterpret_cast<const uint8_t*>(payload),
+        count * sizeof(u64));
+    blake3_hasher_finalize(
+        &hasher, out.bytes.data(), out.bytes.size());
+    return out;
+}
+
 std::vector<u64> signed_message(
     const AuthenticatedMpcMessageContext& context,
     uint32_t sender, uint32_t receiver,
@@ -214,11 +236,9 @@ bool validate_authenticated_mpc_message_context(
 
 Digest compute_authenticated_mpc_payload_binding(
     const std::vector<u64>& payload) {
-    if (payload.empty()) return Digest{};
-    std::vector<u64> words = {
-        MPC_PAYLOAD_DOMAIN, static_cast<u64>(payload.size())};
-    words.insert(words.end(), payload.begin(), payload.end());
-    return hash_words(words);
+    return payload.empty()
+        ? Digest{}
+        : payload_binding_from_words(payload.data(), payload.size());
 }
 
 Digest compute_authenticated_mpc_local_failure_binding(
@@ -342,7 +362,7 @@ AuthenticatedMpcExchange::Capabilities() const {
     c.registry_commitment = auth.RegistryCommitment();
     c.external_registry_anchor = c.external_registry_anchor_verified
         ? auth.ExternalRegistryAnchor() : Digest{};
-    c.implementation_binding = hash_words({MPC_IMPL_DOMAIN, 4ULL});
+    c.implementation_binding = hash_words({MPC_IMPL_DOMAIN, 5ULL});
     c.capability_binding =
         compute_authenticated_mpc_transport_capability_binding(c);
     return c;
@@ -429,8 +449,12 @@ bool AuthenticatedMpcExchange::ObserveVerifiedEnvelope(
         return false;
     }
     const auto& auth = Ed25519TransferAuthenticator::instance();
-    const std::vector<u64> message = signed_message(
-        context, sender, receiver, world_size_, payload);
+    const std::vector<u64> message =
+        build_authenticated_mpc_signed_message(
+            context, sender, receiver,
+            static_cast<size_t>(world_size_),
+            static_cast<uint64_t>(payload.size()),
+            local_payload_binding);
     if (message.empty()) {
         RecordLocalFailure(AuthenticatedMpcLocalFailureKind::MALFORMED_ENVELOPE,
             context, true, sender, receiver, local_payload_binding);
@@ -458,13 +482,17 @@ bool AuthenticatedMpcExchange::ObserveVerifiedEnvelope(
         if (!same_context || previous.context_binding != context_binding ||
             previous.sender != sender || previous.receiver != receiver)
             continue;
-        if (previous.payload == payload) {
+        if (previous.payload_word_count ==
+                static_cast<uint64_t>(payload.size()) &&
+            previous.payload_binding == local_payload_binding) {
             RecordLocalFailure(AuthenticatedMpcLocalFailureKind::EXACT_REPLAY,
                 context, true, sender, receiver, local_payload_binding);
             return false;
         }
         VerifiedEnvelopeRecord conflicting{
-            context_binding, context, sender, receiver, payload, signature};
+            context_binding, context, sender, receiver,
+            static_cast<uint64_t>(payload.size()),
+            local_payload_binding, signature};
         // One conflicting pair is sufficient for public attribution. Keep at
         // most one pending certificate per logical context/sender/receiver so
         // a malicious signer cannot amplify memory use by signing many
@@ -516,7 +544,9 @@ bool AuthenticatedMpcExchange::ObserveVerifiedEnvelope(
     }
 
     verified_envelopes_.push_back(VerifiedEnvelopeRecord{
-        context_binding, context, sender, receiver, payload, signature});
+        context_binding, context, sender, receiver,
+        static_cast<uint64_t>(payload.size()),
+        local_payload_binding, signature});
     return true;
 }
 
@@ -541,10 +571,8 @@ bool AuthenticatedMpcExchange::LastEquivocationEvidence(
         observation.context = record.context;
         observation.sender = record.sender;
         observation.receiver = record.receiver;
-        observation.payload_word_count =
-            static_cast<uint64_t>(record.payload.size());
-        observation.payload_binding =
-            compute_authenticated_mpc_payload_binding(record.payload);
+        observation.payload_word_count = record.payload_word_count;
+        observation.payload_binding = record.payload_binding;
         observation.signature = record.signature;
         observation.registry_commitment = auth.RegistryCommitment();
         observation.observation_binding =
@@ -558,7 +586,10 @@ bool AuthenticatedMpcExchange::LastEquivocationEvidence(
             it->first.context.checkpoint != checkpoint ||
             it->second.context.sid != sid ||
             it->second.context.checkpoint != checkpoint ||
-            it->first.payload.empty() || it->second.payload.empty())
+            it->first.payload_word_count == 0 ||
+            it->second.payload_word_count == 0 ||
+            it->first.payload_binding == Digest{} ||
+            it->second.payload_binding == Digest{})
             continue;
         const auto first = observation_from_record(it->first);
         const auto second = observation_from_record(it->second);
@@ -583,7 +614,9 @@ bool AuthenticatedMpcExchange::ExportVerifiedEnvelopeObservations(
     auto append_record = [&](const VerifiedEnvelopeRecord& record,
                              bool allow_reconciliation_control) -> bool {
         if (record.context.sid != sid ||
-            record.context.checkpoint != checkpoint || record.payload.empty() ||
+            record.context.checkpoint != checkpoint ||
+            record.payload_word_count == 0 ||
+            record.payload_binding == Digest{} ||
             (!allow_reconciliation_control &&
              record.context.protocol_domain ==
                  MPC_OBSERVATION_RECONCILE_DOMAIN))
@@ -593,10 +626,8 @@ bool AuthenticatedMpcExchange::ExportVerifiedEnvelopeObservations(
         observation.context = record.context;
         observation.sender = record.sender;
         observation.receiver = record.receiver;
-        observation.payload_word_count =
-            static_cast<uint64_t>(record.payload.size());
-        observation.payload_binding =
-            compute_authenticated_mpc_payload_binding(record.payload);
+        observation.payload_word_count = record.payload_word_count;
+        observation.payload_binding = record.payload_binding;
         observation.signature = record.signature;
         observation.registry_commitment = auth.RegistryCommitment();
         observation.observation_binding =
@@ -630,6 +661,54 @@ bool AuthenticatedMpcExchange::ExportVerifiedEnvelopeObservations(
         }
     }
     return !observations->empty();
+}
+
+bool AuthenticatedMpcExchange::ExportVerifiedEnvelopeShapeTrace(
+    uint64_t sid, CheckpointId checkpoint,
+    AuthenticatedMpcEnvelopeShapeTrace* trace) const {
+    if(!trace)return false;
+    *trace={};
+    if(sid==0 || checkpoint==0 || CheckpointRetired(sid,checkpoint))
+        return false;
+    // Every accepted record has already passed Ed25519 verification,
+    // context freshness and replay/equivocation checks in ObserveVerifiedEnvelope.
+    // This routine MUST NOT export the payload hash or signature: even such
+    // opaque values may correlate to a private operation or statement.
+    constexpr u64 SHAPE_DOMAIN=0x5056313035545243ULL; // PV105TRC
+    using ShapeRow=std::array<u64,7>;
+    std::vector<ShapeRow> rows;
+    rows.reserve(verified_envelopes_.size());
+    for(const auto& record:verified_envelopes_){
+        const auto& ctx=record.context;
+        if(ctx.sid!=sid || ctx.checkpoint!=checkpoint)continue;
+        if(record.payload_word_count==0 ||
+           record.context_binding==Digest{} ||
+           record.payload_binding==Digest{})return false;
+        rows.push_back({ctx.protocol_domain,ctx.checkpoint,
+                        ctx.round,ctx.sequence,ctx.message_kind,
+                        (static_cast<u64>(record.sender)<<32) |
+                        static_cast<u64>(record.receiver),
+                        record.payload_word_count});
+    }
+    if(rows.empty())return false;
+    const auto bind_rows=[&](const std::vector<ShapeRow>& ordered){
+        std::vector<u64> words;
+        words.reserve(2+ordered.size()*7);
+        words.push_back(SHAPE_DOMAIN);
+        words.push_back(static_cast<u64>(ordered.size()));
+        for(const auto& row:ordered)
+            words.insert(words.end(),row.begin(),row.end());
+        return hash_words(words);
+    };
+    const Digest received=bind_rows(rows);
+    std::sort(rows.begin(),rows.end());
+    const Digest canonical=bind_rows(rows);
+    if(received==Digest{} || canonical==Digest{})return false;
+    trace->available=true;
+    trace->verified_messages=static_cast<uint64_t>(rows.size());
+    trace->arrival_order_binding=received;
+    trace->canonical_multiset_binding=canonical;
+    return true;
 }
 
 bool AuthenticatedMpcExchange::ReconcileCheckpointObservations(
@@ -801,10 +880,8 @@ bool AuthenticatedMpcExchange::AcknowledgeEquivocationEvidence(
         observation.context = record.context;
         observation.sender = record.sender;
         observation.receiver = record.receiver;
-        observation.payload_word_count =
-            static_cast<uint64_t>(record.payload.size());
-        observation.payload_binding =
-            compute_authenticated_mpc_payload_binding(record.payload);
+        observation.payload_word_count = record.payload_word_count;
+        observation.payload_binding = record.payload_binding;
         observation.signature = record.signature;
         observation.registry_commitment = auth.RegistryCommitment();
         observation.observation_binding =
@@ -953,13 +1030,22 @@ bool AuthenticatedMpcExchange::BroadcastWords(
     const uint64_t logical_envelope_bytes =
         count * sizeof(u64) + signature.size();
     experiment_increment_authenticated_collective();
+    const uint64_t broadcast_peers =
+        static_cast<uint64_t>(world_size_ - 1);
+    const uint64_t broadcast_payload_bytes =
+        count * sizeof(u64);
     if (rank_ == broadcaster) {
         experiment_add_authenticated_envelope_traffic(
-            logical_envelope_bytes * static_cast<uint64_t>(world_size_ - 1),
-            0, static_cast<uint64_t>(world_size_ - 1), 0);
+            logical_envelope_bytes * broadcast_peers,
+            0, broadcast_peers, 0);
+        experiment_add_authenticated_traffic_breakdown(
+            broadcast_payload_bytes * broadcast_peers, 0,
+            signature.size() * broadcast_peers, 0, false);
     } else {
         experiment_add_authenticated_envelope_traffic(
             0, logical_envelope_bytes, 0, 1);
+        experiment_add_authenticated_traffic_breakdown(
+            0, broadcast_payload_bytes, 0, signature.size(), false);
     }
 
     const std::vector<u64> received_message = signed_message(
@@ -1032,6 +1118,14 @@ bool AuthenticatedMpcExchange::AllGatherWords(
     experiment_add_authenticated_envelope_traffic(
         logical_envelope_bytes * peer_count,
         logical_envelope_bytes * peer_count, peer_count, peer_count);
+    const uint64_t gathered_payload_bytes =
+        static_cast<uint64_t>(local_payload.size() * sizeof(u64)) *
+        peer_count;
+    const uint64_t gathered_overhead_bytes =
+        static_cast<uint64_t>(local_signature.size()) * peer_count;
+    experiment_add_authenticated_traffic_breakdown(
+        gathered_payload_bytes, gathered_payload_bytes,
+        gathered_overhead_bytes, gathered_overhead_bytes, false);
 
     const auto capabilities = Capabilities();
     std::vector<u64> transcript_words = transcript_prefix(
@@ -1100,36 +1194,207 @@ bool AuthenticatedMpcExchange::ScatterWords(
     Digest* transcript_binding) const {
     if (!received_payload || dealer < 0 || dealer >= world_size_ ||
         words_per_receiver == 0 ||
+        words_per_receiver >
+            static_cast<size_t>(std::numeric_limits<int>::max()) ||
         (rank_ == dealer
              ? dealer_payloads.size() !=
                    static_cast<size_t>(world_size_) * words_per_receiver
-             : !dealer_payloads.empty()))
+             : !dealer_payloads.empty()) ||
+        !SameContextOnAllRanks(context))
         return false;
-    std::vector<u64> send(
-        static_cast<size_t>(world_size_) * words_per_receiver, 0ULL);
-    if (rank_ == dealer) send = dealer_payloads;
-    std::vector<u64> received;
-    Digest alltoall_binding{};
-    if (!AllToAllWords(
-            context, send, words_per_receiver,
-            &received, &alltoall_binding))
+
+    const auto& auth = Ed25519TransferAuthenticator::instance();
+    if (!auth.ready() || auth.RegistryCommitment() == Digest{})
         return false;
-    const size_t offset = static_cast<size_t>(dealer) * words_per_receiver;
-    received_payload->assign(
-        received.begin() + static_cast<std::ptrdiff_t>(offset),
-        received.begin() + static_cast<std::ptrdiff_t>(
-            offset + words_per_receiver));
+
+    // Scatter is a one-dealer operation.  The previous implementation reused
+    // AllToAllWords, which forced every non-dealer to transmit a full-size
+    // zero payload to every peer.  We instead authenticate only the N
+    // dealer->receiver payloads and bind all of them to one signed batch root.
+    std::vector<uint8_t> dealer_signatures(
+        static_cast<size_t>(world_size_) * 64, 0);
+    std::vector<u64> leaf_words(
+        static_cast<size_t>(world_size_) * 4, 0);
+    std::array<uint8_t, 64> batch_signature{};
+
+    if (rank_ == dealer) {
+        for (int receiver = 0; receiver < world_size_; ++receiver) {
+            const size_t offset =
+                static_cast<size_t>(receiver) * words_per_receiver;
+            const u64* payload =
+                dealer_payloads.data() + offset;
+            const Digest payload_binding =
+                payload_binding_from_words(payload, words_per_receiver);
+            const std::vector<u64> message =
+                build_authenticated_mpc_signed_message(
+                    context, static_cast<uint32_t>(dealer),
+                    static_cast<uint32_t>(receiver),
+                    static_cast<size_t>(world_size_),
+                    static_cast<uint64_t>(words_per_receiver),
+                    payload_binding);
+            std::array<uint8_t, 64> signature{};
+            if (message.empty() ||
+                !auth.SignWords(
+                    MPC_SIGNATURE_DOMAIN, message, &signature))
+                return false;
+            std::memcpy(
+                dealer_signatures.data() +
+                    static_cast<size_t>(receiver) * signature.size(),
+                signature.data(), signature.size());
+
+            if (payload_binding == Digest{}) return false;
+            for (size_t word = 0; word < 4; ++word) {
+                std::memcpy(
+                    &leaf_words[static_cast<size_t>(receiver) * 4 + word],
+                    payload_binding.bytes.data() + 8 * word, 8);
+            }
+        }
+
+        std::vector<u64> root_words = transcript_prefix(
+            MPC_SCATTER_BATCH_ROOT_DOMAIN,
+            context, world_size_, Capabilities());
+        root_words.push_back(static_cast<u64>(dealer));
+        root_words.push_back(static_cast<u64>(words_per_receiver));
+        for (int receiver = 0; receiver < world_size_; ++receiver) {
+            root_words.push_back(static_cast<u64>(receiver));
+            const Digest leaf = digest_from_words(
+                leaf_words, static_cast<size_t>(receiver) * 4);
+            if (leaf == Digest{}) return false;
+            append_digest(leaf, &root_words);
+        }
+        const Digest batch_root = hash_words(root_words);
+        if (batch_root == Digest{}) return false;
+
+        std::vector<u64> batch_message = {
+            MPC_SCATTER_BATCH_ROOT_DOMAIN,
+            static_cast<u64>(dealer),
+            static_cast<u64>(world_size_),
+            static_cast<u64>(words_per_receiver)};
+        append_digest(
+            compute_authenticated_mpc_context_binding(context),
+            &batch_message);
+        append_digest(batch_root, &batch_message);
+        if (!auth.SignWords(
+                MPC_SCATTER_BATCH_SIGNATURE_DOMAIN,
+                batch_message, &batch_signature))
+            return false;
+    }
+
+    // The compact leaf table and one batch signature are common to all
+    // receivers.  They make the recipient-specific payloads part of one
+    // checkpoint-scoped authenticated batch without broadcasting the payloads.
+    MPI_Bcast(
+        leaf_words.data(), static_cast<int>(leaf_words.size()),
+        MPI_UINT64_T, dealer, comm_);
+    MPI_Bcast(
+        batch_signature.data(), static_cast<int>(batch_signature.size()),
+        MPI_UNSIGNED_CHAR, dealer, comm_);
+
+    std::vector<u64> root_words = transcript_prefix(
+        MPC_SCATTER_BATCH_ROOT_DOMAIN,
+        context, world_size_, Capabilities());
+    root_words.push_back(static_cast<u64>(dealer));
+    root_words.push_back(static_cast<u64>(words_per_receiver));
+    for (int receiver = 0; receiver < world_size_; ++receiver) {
+        root_words.push_back(static_cast<u64>(receiver));
+        const Digest leaf = digest_from_words(
+            leaf_words, static_cast<size_t>(receiver) * 4);
+        if (leaf == Digest{}) return false;
+        append_digest(leaf, &root_words);
+    }
+    const Digest batch_root = hash_words(root_words);
+    if (batch_root == Digest{}) return false;
+
+    std::vector<u64> batch_message = {
+        MPC_SCATTER_BATCH_ROOT_DOMAIN,
+        static_cast<u64>(dealer),
+        static_cast<u64>(world_size_),
+        static_cast<u64>(words_per_receiver)};
+    append_digest(
+        compute_authenticated_mpc_context_binding(context),
+        &batch_message);
+    append_digest(batch_root, &batch_message);
+    if (!auth.VerifyWords(
+            MPC_SCATTER_BATCH_SIGNATURE_DOMAIN, batch_message,
+            batch_signature, static_cast<uint32_t>(dealer)))
+        return false;
+
+    received_payload->resize(words_per_receiver);
+    MPI_Scatter(
+        rank_ == dealer ? dealer_payloads.data() : nullptr,
+        static_cast<int>(words_per_receiver), MPI_UINT64_T,
+        received_payload->data(),
+        static_cast<int>(words_per_receiver), MPI_UINT64_T,
+        dealer, comm_);
+
+    std::array<uint8_t, 64> local_signature{};
+    MPI_Scatter(
+        rank_ == dealer ? dealer_signatures.data() : nullptr,
+        static_cast<int>(local_signature.size()), MPI_UNSIGNED_CHAR,
+        local_signature.data(),
+        static_cast<int>(local_signature.size()), MPI_UNSIGNED_CHAR,
+        dealer, comm_);
+
+    const Digest local_payload_binding =
+        compute_authenticated_mpc_payload_binding(*received_payload);
+    const Digest committed_local_binding = digest_from_words(
+        leaf_words, static_cast<size_t>(rank_) * 4);
+    if (local_payload_binding == Digest{} ||
+        local_payload_binding != committed_local_binding)
+        return false;
+
+    if (!ObserveVerifiedEnvelope(
+            context, static_cast<uint32_t>(dealer),
+            static_cast<uint32_t>(rank_),
+            *received_payload, local_signature))
+        return false;
+
+    const uint64_t peer_count =
+        static_cast<uint64_t>(world_size_ - 1);
+    const uint64_t recipient_envelope_bytes =
+        static_cast<uint64_t>(
+            words_per_receiver * sizeof(u64) +
+            local_signature.size());
+    const uint64_t batch_summary_bytes =
+        static_cast<uint64_t>(
+            leaf_words.size() * sizeof(u64) +
+            batch_signature.size());
+    experiment_increment_authenticated_collective();
+    const bool baseline_equivalent_payload =
+        context.protocol_domain ==
+            AUTHENTICATED_MPC_BASELINE_INPUT_DOMAIN;
+    const uint64_t recipient_payload_bytes =
+        static_cast<uint64_t>(words_per_receiver * sizeof(u64));
+    const uint64_t recipient_overhead_bytes =
+        static_cast<uint64_t>(local_signature.size()) +
+        batch_summary_bytes;
+    if (rank_ == dealer) {
+        experiment_add_authenticated_envelope_traffic(
+            (recipient_envelope_bytes + batch_summary_bytes) * peer_count,
+            0, 2 * peer_count, 0);
+        experiment_add_authenticated_traffic_breakdown(
+            recipient_payload_bytes * peer_count, 0,
+            recipient_overhead_bytes * peer_count, 0,
+            baseline_equivalent_payload);
+    } else {
+        experiment_add_authenticated_envelope_traffic(
+            0, recipient_envelope_bytes + batch_summary_bytes,
+            0, 2);
+        experiment_add_authenticated_traffic_breakdown(
+            0, recipient_payload_bytes,
+            0, recipient_overhead_bytes,
+            baseline_equivalent_payload);
+    }
+
     if (transcript_binding) {
-        // AllToAllWords returns a globally canonical transcript binding that
-        // already commits to every signed sender->receiver payload. Scatter
-        // must therefore bind only the dealer/shape and that global exchange
-        // commitment; appending this rank's local payload would make the VSS
-        // receipt receiver-specific and break checkpoint-wide agreement.
         std::vector<u64> words = transcript_prefix(
             MPC_SCATTER_OP, context, world_size_, Capabilities());
         words.push_back(static_cast<u64>(dealer));
         words.push_back(static_cast<u64>(words_per_receiver));
-        append_digest(alltoall_binding, &words);
+        append_digest(
+            auth.PublicKeyId(static_cast<uint32_t>(dealer)), &words);
+        append_digest(batch_root, &words);
+        append_signature(batch_signature, &words);
         *transcript_binding = hash_words(words);
         if (*transcript_binding == Digest{}) return false;
     }
@@ -1194,6 +1459,14 @@ bool AuthenticatedMpcExchange::AllToAllWords(
     experiment_add_authenticated_envelope_traffic(
         logical_envelope_bytes * peer_count,
         logical_envelope_bytes * peer_count, peer_count, peer_count);
+    const uint64_t alltoall_payload_bytes =
+        static_cast<uint64_t>(words_per_receiver * sizeof(u64)) *
+        peer_count;
+    const uint64_t alltoall_overhead_bytes =
+        64ULL * peer_count;
+    experiment_add_authenticated_traffic_breakdown(
+        alltoall_payload_bytes, alltoall_payload_bytes,
+        alltoall_overhead_bytes, alltoall_overhead_bytes, false);
 
     const auto capabilities = Capabilities();
     // Each receiver first commits to the complete set of signed messages it

@@ -1,0 +1,18 @@
+PVIA RELEASE GATE MATRIX: PASS
+np=4
+cases=5
+cosumcheck_positive=ALLOW
+cosumcheck_injected=WITHHOLD
+distributed_sumcheck_positive=ALLOW
+distributed_sumcheck_injected=WITHHOLD
+encoding_positive=ALLOW
+encoding_injected=WITHHOLD
+pcs_open_positive=ALLOW
+pcs_open_injected=WITHHOLD
+pcs_batch_open_positive=ALLOW
+pcs_batch_open_injected=WITHHOLD
+exact_scope=BOUND
+private_localization=folding-only
+other_families=release-blocking-only
+decision_backend=test-only
+claim_scope=release-gate-withholding-semantics

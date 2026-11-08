@@ -3,6 +3,7 @@
 #include "MultiplicationConsistencyProof.hpp"
 
 #include <functional>
+#include <string>
 #include <utility>
 
 namespace pvia {
@@ -14,6 +15,7 @@ struct MultiplicationConsistencyProviderCallbacks {
     std::function<bool(
         const MultiplicationConsistencyStatement&,
         const MultiplicationConsistencyProofArtifact&)> verify;
+    std::function<std::string()> last_error;
 };
 
 // Adapter for an externally supplied proof provider.  This class contributes
@@ -31,6 +33,7 @@ public:
     bool ready() const { return ready_; }
 
     MultiplicationConsistencyCapabilities Capabilities() const override;
+    const std::string& last_error() const { return last_error_; }
     MultiplicationConsistencyProofArtifact Prove(
         const MultiplicationConsistencyStatement& statement,
         const MultiplicationConsistencyWitness& witness) const override;
@@ -43,6 +46,7 @@ private:
     uint32_t expected_proof_system_id_ = 0;
     MultiplicationConsistencyProviderCallbacks callbacks_{};
     bool ready_ = false;
+    mutable std::string last_error_;
 };
 
 } // namespace pvia

@@ -3,6 +3,7 @@
 #include "ExperimentMetrics.hpp"
 #include "ProtocolTrafficMetrics.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -156,18 +157,26 @@ bool validate_public_direct_vector(
         expected.empty() || expected.size() != actual.size())
         return false;
 
+    ExperimentDurationScope duration_scope(
+        ExperimentDurationKind::PUBLIC_DIRECT_VALIDATION);
     ExperimentControlTrafficScope traffic_scope(
         ExperimentControlTrafficKind::PUBLIC_DIRECT_VALIDATION);
 
     const Digest context_binding = compute_public_direct_context_binding(
         kind, public_context_fields, public_context_words);
-    const Digest expected_digest = hash_field_vector(expected);
+
+    // On the successful path the two public vectors are byte-for-byte equal.
+    // Compare them directly first, hash the actual vector once, and reuse that
+    // digest as the expected digest.  If they differ, compute both digests so
+    // the rejecting-path record still carries the exact expected/actual pair.
+    const bool local_valid =
+        std::equal(expected.begin(), expected.end(), actual.begin());
     const Digest actual_digest = hash_field_vector(actual);
+    const Digest expected_digest =
+        local_valid ? actual_digest : hash_field_vector(expected);
     if (context_binding == Digest{} ||
         expected_digest == Digest{} || actual_digest == Digest{})
         return false;
-
-    const bool local_valid = expected_digest == actual_digest;
     std::vector<u64> local_record = {
         PUBLIC_DIRECT_RECORD_DOMAIN,
         runtime.enabled() ? runtime.session_id() : 0ULL,

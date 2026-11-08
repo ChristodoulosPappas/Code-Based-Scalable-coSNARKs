@@ -190,29 +190,34 @@ void merkle_tree::merkle_tree_prover::MT_commit(F *leafs,vector<vector<__hhash_d
     merkle_tree::merkle_tree_prover::create_tree( leaf_hashes.size(), hashes, sizeof(__hhash_digest), true);
 }
 
+_hash merkle_tree::hash_leaf_blake(const F* leaf4)
+{
+    uint8_t data[64];
+    virgo::fieldElement element[2];
+    element[0] = leaf4[0];
+    element[1] = leaf4[1];
+    memcpy(data, element, 2 * sizeof(virgo::fieldElement));
+    element[0] = leaf4[2];
+    element[1] = leaf4[3];
+    memcpy(data + 32, element, 2 * sizeof(virgo::fieldElement));
+    _hash out{};
+    blake3_hash(data, out.arr);
+    return out;
+}
+
 void merkle_tree::merkle_tree_prover::MT_commit_Blake(F *leafs,vector<vector<_hash>> &hashes, int N){
     //vector<vector<uint8_t>> leaf_hashes(N/4);
     
     //for(int  i= 0; i < leaf_hashes.size(); i++){
     //    leaf_hashes[i].resize(32);
     //}
-    uint8_t data[2*32], ret;
-    //data[0] = prev_hash;
-    virgo::fieldElement element[2];
     if(hashes.size() == 0){
         hashes.resize((int)log2(N/4)+1);
     }
     hashes[0].resize(N/4);
    #pragma omp parallel for
    for(int i = 0; i < N/4; i++){
-        element[0] = leafs[4*i];
-        element[1] = leafs[4*i+1];
-        memcpy(data, element, 2 * sizeof(virgo::fieldElement));
-        element[0] = leafs[4*i+2];
-        element[1] = leafs[4*i+3];
-        //hashes[0][i].resize(32);
-        memcpy(data + 32, element, 2 * sizeof(virgo::fieldElement));
-        blake3_hash(data, hashes[0][i].arr);
+        hashes[0][i] = merkle_tree::hash_leaf_blake(leafs + 4*i);
     }
     
     merkle_tree::merkle_tree_prover::create_tree_blake( hashes[0].size(), hashes, sizeof(__hhash_digest), true);
@@ -276,7 +281,7 @@ void merkle_tree::merkle_tree_prover::create_tree_blake(int ele_num, vector<vect
                 data[j] = hashes[lvl-1][ i * 2].arr[j];
             }
             for(int j = 0; j < 32; j++){
-                data[j+32] = hashes[lvl-1][ i * 2].arr[j];
+                data[j+32] = hashes[lvl-1][ i * 2 + 1].arr[j];
             }
             //hashes[lvl][i].resize(32);
             blake3_hash(data, hashes[lvl][i].arr);
@@ -322,55 +327,41 @@ vector<_hash> merkle_tree::merkle_tree_prover::open_tree_blake(vector<vector<_ha
     return path;
 }
 
-bool merkle_tree::merkle_tree_verifier::verify_claim_opt_blake(vector<vector<_hash>> &MT, const _hash* path, int pos_element_arr, int N,  vector<bool> &visited, double &ps)
+bool merkle_tree::merkle_tree_verifier::verify_claimed_leaf_blake(vector<vector<_hash>> &MT, const _hash &leaf_hash, const _hash* path, int pos_element_arr, int N, vector<bool> &visited, double &ps)
 {
-   //check N is power of 2
-    assert((N & (-N)) == N);
-    
+    if (N <= 0 || (N & (N - 1)) != 0) return false;
+    if (MT.empty() || MT.back().size() != 1 || pos_element_arr < 0 || pos_element_arr >= N) return false;
+
     int pos = pos_element_arr;
-    if(MT[0].size() != N){
-        printf("Error in sizes %d,%d\n",N,MT[0].size());
-        exit(-1);
-    }
-    if(pos >= MT[0].size()){
-        printf("Error %d,%d\n",pos,MT[0].size());
-        exit(-1);
-    }
-    int pos_element = N+pos_element_arr;
-    _hash leaf_hash = path[0];
-    _hash data[2];
-    for(int i = 0; i < MT.size()-1; i++){
-        if((pos_element^1) >= (2*N)){
-            printf("EERROR %d,%d,%d\n",2*N,pos_element,pos_element^1);
-            exit(-1);
+    int tree_pos = N + pos;
+    _hash node = leaf_hash;
+    for (size_t level = 0; level + 1 < MT.size(); ++level) {
+        uint8_t data[64];
+        if ((pos & 1) == 0) {
+            memcpy(data, node.arr, 32);
+            memcpy(data + 32, path[level].arr, 32);
+        } else {
+            memcpy(data, path[level].arr, 32);
+            memcpy(data + 32, node.arr, 32);
         }
-        
-        if(!visited[pos_element ^ 1]){
-            
-            data[pos & 1] = leaf_hash;
-            if((pos^1) >= MT[i].size()){
-                printf("ERRoR in Verification %d,%d\n",pos^1,MT[i].size());
-                exit(-1);
-            }
-            data[(pos & 1) ^ 1] = MT[i][pos ^ 1];
-            
-            my_hhash(data, &leaf_hash);
-            visited[pos_element ^ 1] = true;
-            pos_element /= 2;
-            pos /= 2;
-            visited[pos_element] = true;
+        blake3_hash(data, node.arr);
+        const int sibling_tree_pos = tree_pos ^ 1;
+        if (sibling_tree_pos >= 0 && sibling_tree_pos < static_cast<int>(visited.size()) && !visited[sibling_tree_pos]) {
+            visited[sibling_tree_pos] = true;
             ps += 32.0/1024.0;
-            
-        }else{
-            return true;
         }
-    
+        tree_pos /= 2;
+        if (tree_pos >= 0 && tree_pos < static_cast<int>(visited.size())) visited[tree_pos] = true;
+        pos /= 2;
     }
-    
-    return true;
+    return memcmp(node.arr, MT.back()[0].arr, 32) == 0;
 }
 
-
+bool merkle_tree::merkle_tree_verifier::verify_claim_opt_blake(vector<vector<_hash>> &MT, const _hash* path, int pos_element_arr, int N, vector<bool> &visited, double &ps)
+{
+    if (MT.empty() || MT[0].size() != static_cast<size_t>(N) || pos_element_arr < 0 || pos_element_arr >= N) return false;
+    return verify_claimed_leaf_blake(MT, MT[0][pos_element_arr], path, pos_element_arr, N, visited, ps);
+}
 
 bool merkle_tree::merkle_tree_verifier::verify_claim_opt(vector<vector<__hhash_digest>> &MT, const __hhash_digest* path, int pos_element_arr, int N,  bool *visited, double &ps)
 {

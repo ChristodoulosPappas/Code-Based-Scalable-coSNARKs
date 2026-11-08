@@ -10,8 +10,83 @@ extern timer pt,pt_cp,vt;
 extern timer_cpu pt_cpu;
 extern int cosumcheck_offset;
 
+namespace {
 
+F pvia_linear_pair_value(const vector<F>& values, size_t pair, const F& x) {
+    const size_t offset = 2 * pair;
+    return values[offset] + x * (values[offset + 1] - values[offset]);
+}
 
+bool pvia_verify_zero_round_polynomial(
+    const cubic_poly& H, int iter, const F& b,
+    const vector<F>& v1, const vector<F>& v2, const vector<F>& v3,
+    const vector<F>& beta1, const vector<F>& r1, const vector<F>& r2) {
+    if (iter < 0) return false;
+    const size_t count = v1.size() / (1ULL << (iter + 1));
+    if (2 * count > v2.size() || 2 * count > v3.size() ||
+        2 * count > beta1.size() || 2 * count > r1.size() ||
+        2 * count > r2.size()) return false;
+    const F points[] = {F(0), F(1), F(2), F(3)};
+    for (const F& x : points) {
+        F expected(0);
+        for (size_t j = 0; j < count; ++j) {
+            const F left = pvia_linear_pair_value(v1, j, x);
+            const F right = pvia_linear_pair_value(v2, j, x);
+            const F output = pvia_linear_pair_value(v3, j, x);
+            const F mask_left = pvia_linear_pair_value(r1, j, x);
+            const F mask_right = pvia_linear_pair_value(r2, j, x);
+            const F beta = pvia_linear_pair_value(beta1, j, x);
+            expected += (left * right + b * mask_left * mask_right - output) * beta;
+        }
+        if (H.eval(x) != expected) return false;
+    }
+    return true;
+}
+
+bool pvia_verify_quadratic_round_polynomial(
+    const quadratic_poly& H, int iter,
+    const vector<F>& v1, const vector<F>& v2) {
+    if (iter < 0) return false;
+    const size_t count = v1.size() / (1ULL << (iter + 1));
+    if (2 * count > v2.size()) return false;
+    const F points[] = {F(0), F(1), F(2)};
+    for (const F& x : points) {
+        F expected(0);
+        for (size_t j = 0; j < count; ++j)
+            expected += pvia_linear_pair_value(v1, j, x) *
+                        pvia_linear_pair_value(v2, j, x);
+        if (H.eval(x) != expected) return false;
+    }
+    return true;
+}
+
+bool pvia_verify_batch_round_polynomial(
+    const quadratic_poly& H, int iter, const F& b,
+    const vector<F>& v1, const vector<F>& v2,
+    const vector<F>& v3, const vector<F>& v4,
+    const vector<F>& r1, const vector<F>& r2) {
+    if (iter < 0) return false;
+    const size_t count = v1.size() / (1ULL << (iter + 1));
+    if (2 * count > v2.size() || 2 * count > v3.size() ||
+        2 * count > v4.size() || 2 * count > r1.size() ||
+        2 * count > r2.size()) return false;
+    const F points[] = {F(0), F(1), F(2)};
+    for (const F& x : points) {
+        F expected(0);
+        for (size_t j = 0; j < count; ++j) {
+            expected += pvia_linear_pair_value(v1, j, x) *
+                        pvia_linear_pair_value(v2, j, x);
+            expected += pvia_linear_pair_value(v3, j, x) *
+                        pvia_linear_pair_value(v4, j, x);
+            expected += b * pvia_linear_pair_value(r1, j, x) *
+                        pvia_linear_pair_value(r2, j, x);
+        }
+        if (H.eval(x) != expected) return false;
+    }
+    return true;
+}
+
+} // namespace
 
 cubic_poly _zero_check_sumcheck_phase1(int iter, F b,vector<F> &v1,vector<F> &v2, vector<F> &v3, vector<F> &beta1, vector<F> &r1, vector<F> &r2){
     quadratic_poly p = quadratic_poly(F_ZERO,F_ZERO,F_ZERO);
@@ -106,6 +181,14 @@ vector<std::pair<F,vector<F>>> _zero_check_sumcheck(F y, vector<F> &v1,
             pt_cp.start();
             H = _zero_check_sumcheck_phase1(i, b,v1,v2, v3, beta1, h1, h2);
             pt_cp.end();
+            if (pvia::Runtime::instance().enabled() &&
+                !pvia_verify_zero_round_polynomial(
+                    H, i, b, v1, v2, v3, beta1, h1, h2)) {
+                pvia::Runtime::instance().handle_global_failure(
+                    "cosumcheck_zero_local_arithmetic",
+                    pvia::Phase::COSUMCHECK_ZERO, i);
+                return {};
+            }
 
             // PVIA: bind the honest local derivation before any injected deviation.
             pvia::RecordId pvia_record = 0;
@@ -113,16 +196,13 @@ vector<std::pair<F,vector<F>>> _zero_check_sumcheck(F y, vector<F> &v1,
                 auto& rt = pvia::Runtime::instance();
                 const size_t active_count =
                     2 * (v1.size() / (1ULL << (i + 1)));
-                vector<F> pvia_source_state;
-                pvia_source_state.insert(pvia_source_state.end(), v1.begin(), v1.begin()+active_count);
-                pvia_source_state.insert(pvia_source_state.end(), v2.begin(), v2.begin()+active_count);
-                pvia_source_state.insert(pvia_source_state.end(), v3.begin(), v3.begin()+active_count);
-                pvia_source_state.insert(pvia_source_state.end(), beta1.begin(), beta1.begin()+active_count);
-                pvia_source_state.insert(pvia_source_state.end(), h1.begin(), h1.begin()+active_count);
-                pvia_source_state.insert(pvia_source_state.end(), h2.begin(), h2.begin()+active_count);
-                const pvia::StateId source_state = rt.import_state(
+                const std::vector<pvia::FieldStateSegment> pvia_source_segments = {
+                    {&v1, 0, active_count}, {&v2, 0, active_count},
+                    {&v3, 0, active_count}, {&beta1, 0, active_count},
+                    {&h1, 0, active_count}, {&h2, 0, active_count}};
+                const pvia::StateId source_state = rt.import_state_slices(
                     "cosumcheck_zero_round_input", pvia::Phase::COSUMCHECK_ZERO,
-                    pvia_source_state);
+                    pvia_source_segments);
                 std::vector<pvia::OperationRef> predecessors;
                 const auto predecessor = rt.previous_round_operation_ref(
                     pvia::Phase::COSUMCHECK_ZERO, static_cast<uint32_t>(i),
@@ -142,7 +222,9 @@ vector<std::pair<F,vector<F>>> _zero_check_sumcheck(F y, vector<F> &v1,
                 pvia::Runtime::instance().activate_cubic(pvia_record, H);
             }
 
-            H = aggregate_cubic_poly(H,beta2,k,_k,N, "cosumcheck_zero_round_release");
+            H = aggregate_cubic_poly(
+                H, beta2, k, _k, N, "cosumcheck_zero_round_release",
+                pvia::Phase::COSUMCHECK_ZERO, static_cast<uint32_t>(i));
             
             if(rank == 0)vt.start();
         
@@ -239,18 +321,24 @@ vector<std::pair<F,vector<F>>> _quadratic_cosumcheck(F y, vector<F> &v1, vector<
         for(int j = 0; j < v1.size()/(1<<(i+1)); j++) H = H + linear_poly(v1[2*j+1]-v1[2*j],v1[2*j])*linear_poly(v2[2*j+1]-v2[2*j],v2[2*j]);
         
         pt_cp.end();
+        if (pvia::Runtime::instance().enabled() &&
+            !pvia_verify_quadratic_round_polynomial(H, i, v1, v2)) {
+            pvia::Runtime::instance().handle_global_failure(
+                "cosumcheck_quadratic_local_arithmetic",
+                pvia::Phase::COSUMCHECK_QUADRATIC, i);
+            return {};
+        }
         // PVIA: one responsibility block per prover and coSumcheck round.
         pvia::RecordId pvia_record = 0;
         if (pvia::Runtime::instance().enabled()) {
             auto& rt = pvia::Runtime::instance();
             const size_t active_count =
                 2 * (v1.size() / (1ULL << (i + 1)));
-            vector<F> pvia_source_state;
-            pvia_source_state.insert(pvia_source_state.end(), v1.begin(), v1.begin()+active_count);
-            pvia_source_state.insert(pvia_source_state.end(), v2.begin(), v2.begin()+active_count);
-            const pvia::StateId source_state = rt.import_state(
+            const std::vector<pvia::FieldStateSegment> pvia_source_segments = {
+                {&v1, 0, active_count}, {&v2, 0, active_count}};
+            const pvia::StateId source_state = rt.import_state_slices(
                 "cosumcheck_quadratic_round_input",
-                pvia::Phase::COSUMCHECK_QUADRATIC, pvia_source_state);
+                pvia::Phase::COSUMCHECK_QUADRATIC, pvia_source_segments);
             std::vector<pvia::OperationRef> predecessors;
             const auto predecessor = rt.previous_round_operation_ref(
                 pvia::Phase::COSUMCHECK_QUADRATIC, static_cast<uint32_t>(i),
@@ -269,7 +357,9 @@ vector<std::pair<F,vector<F>>> _quadratic_cosumcheck(F y, vector<F> &v1, vector<
                 pvia_round_aux);
             pvia::Runtime::instance().activate_quadratic(pvia_record, H);
         }
-        H = aggregate_quadratic_poly(H,k,_k,N, "cosumcheck_quadratic_round_release");
+        H = aggregate_quadratic_poly(
+            H, k, _k, N, "cosumcheck_quadratic_round_release",
+            pvia::Phase::COSUMCHECK_QUADRATIC, static_cast<uint32_t>(i));
         if(rank == 0)vt.start();
         if(H.eval(0) + H.eval(1) != y){
             printf("Error cubic sumcheck %d,(%lld,%lld),(%lld,%lld)\n",i,y.real,y.img,(H.eval(0) + H.eval(1)).real,(H.eval(0) + H.eval(1)).img);
@@ -343,22 +433,27 @@ vector<std::pair<F,vector<F>>> _quadratic_batch_sumcheck(F y, vector<F> &v1,
         quadratic_poly H;
         H = _quadratic_batch_sumcheck_phase1(i, b,v1,v2, v3,v4, h1, h2);
         pt_cp.end();
+        if (pvia::Runtime::instance().enabled() &&
+            !pvia_verify_batch_round_polynomial(
+                H, i, b, v1, v2, v3, v4, h1, h2)) {
+            pvia::Runtime::instance().handle_global_failure(
+                "cosumcheck_batch_local_arithmetic",
+                pvia::Phase::COSUMCHECK_BATCH, i);
+            return {};
+        }
         // PVIA: bind batch-Sumcheck local polynomial before aggregation.
         pvia::RecordId pvia_record = 0;
         if (pvia::Runtime::instance().enabled()) {
             auto& rt = pvia::Runtime::instance();
             const size_t active_count =
                 2 * (v1.size() / (1ULL << (i + 1)));
-            vector<F> pvia_source_state;
-            pvia_source_state.insert(pvia_source_state.end(), v1.begin(), v1.begin()+active_count);
-            pvia_source_state.insert(pvia_source_state.end(), v2.begin(), v2.begin()+active_count);
-            pvia_source_state.insert(pvia_source_state.end(), v3.begin(), v3.begin()+active_count);
-            pvia_source_state.insert(pvia_source_state.end(), v4.begin(), v4.begin()+active_count);
-            pvia_source_state.insert(pvia_source_state.end(), h1.begin(), h1.begin()+active_count);
-            pvia_source_state.insert(pvia_source_state.end(), h2.begin(), h2.begin()+active_count);
-            const pvia::StateId source_state = rt.import_state(
+            const std::vector<pvia::FieldStateSegment> pvia_source_segments = {
+                {&v1, 0, active_count}, {&v2, 0, active_count},
+                {&v3, 0, active_count}, {&v4, 0, active_count},
+                {&h1, 0, active_count}, {&h2, 0, active_count}};
+            const pvia::StateId source_state = rt.import_state_slices(
                 "cosumcheck_batch_round_input",
-                pvia::Phase::COSUMCHECK_BATCH, pvia_source_state);
+                pvia::Phase::COSUMCHECK_BATCH, pvia_source_segments);
             std::vector<pvia::OperationRef> predecessors;
             const auto predecessor = rt.previous_round_operation_ref(
                 pvia::Phase::COSUMCHECK_BATCH, static_cast<uint32_t>(i),
@@ -377,7 +472,9 @@ vector<std::pair<F,vector<F>>> _quadratic_batch_sumcheck(F y, vector<F> &v1,
                 pvia_round_aux);
             pvia::Runtime::instance().activate_quadratic(pvia_record, H);
         }
-        H = aggregate_quadratic_poly(H,k,_k,N, "cosumcheck_batch_round_release");
+        H = aggregate_quadratic_poly(
+            H, k, _k, N, "cosumcheck_batch_round_release",
+            pvia::Phase::COSUMCHECK_BATCH, static_cast<uint32_t>(i));
         pt_cp.start();
         if(rank == 0)vt.start();
     

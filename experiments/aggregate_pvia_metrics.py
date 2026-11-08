@@ -4,8 +4,23 @@ import csv
 from pathlib import Path
 from statistics import mean
 
+OPTIONAL_BREAKDOWN_FIELDS = {
+    'auth_baseline_payload_sent_bytes',
+    'auth_baseline_payload_recv_bytes',
+    'auth_pvia_payload_sent_bytes',
+    'auth_pvia_payload_recv_bytes',
+    'auth_overhead_sent_bytes',
+    'auth_overhead_recv_bytes',
+    'baseline_input_payload_sent_bytes',
+    'baseline_input_payload_recv_bytes',
+}
+
 COUNTER_SUM_FIELDS = [
     'auth_sent_bytes', 'auth_recv_bytes',
+    'auth_baseline_payload_sent_bytes', 'auth_baseline_payload_recv_bytes',
+    'auth_pvia_payload_sent_bytes', 'auth_pvia_payload_recv_bytes',
+    'auth_overhead_sent_bytes', 'auth_overhead_recv_bytes',
+    'baseline_input_payload_sent_bytes', 'baseline_input_payload_recv_bytes',
     'auth_sent_messages', 'auth_recv_messages',
     'auth_collective_calls', 'control_sent_bytes', 'control_recv_bytes',
     'control_sent_messages', 'control_recv_messages',
@@ -38,9 +53,25 @@ CONSENSUS_STATE_FIELDS = [
 ]
 RESOURCE_FIELDS = ['peak_rss_kb']
 
+# These counters are cluster-summed for end-to-end communication accounting,
+# but their per-rank distribution is also useful for interpreting scalability.
+RANK_DISTRIBUTION_FIELDS = [
+    'auth_sent_bytes', 'auth_recv_bytes',
+    'control_sent_bytes', 'control_recv_bytes',
+    'runtime_init_control_sent_bytes', 'runtime_init_control_recv_bytes',
+    'preprocessing_control_sent_bytes', 'preprocessing_control_recv_bytes',
+    'initial_validity_control_sent_bytes', 'initial_validity_control_recv_bytes',
+    'consistency_provider_control_sent_bytes',
+    'consistency_provider_control_recv_bytes',
+    'public_direct_validation_control_sent_bytes',
+    'public_direct_validation_control_recv_bytes',
+]
+
 TIME_FIELDS = [
     'program_total_ns', 'transfer_meta_seal_ns',
     'transfer_meta_observe_ns', 'transfer_meta_verify_ns',
+    'runtime_init_ns', 'preprocessing_ns', 'initial_validity_ns',
+    'public_direct_validation_ns', 'consistency_provider_ns',
     'failure_total_ns', 'scope_sync_ns', 'batch_check_ns',
     'termination_query_ns', 'cert_fetch_ns', 'cert_verify_ns',
     'cert_encode_ns', 'cert_export_ns',
@@ -75,7 +106,14 @@ def aggregate(rows):
         'rank_rows': len(rows),
     }
     for field in COUNTER_SUM_FIELDS:
-        out['sum_' + field] = sum(int(r[field]) for r in rows)
+        if field in OPTIONAL_BREAKDOWN_FIELDS:
+            out['sum_' + field] = sum(int(r.get(field, 0) or 0) for r in rows)
+        else:
+            out['sum_' + field] = sum(int(r[field]) for r in rows)
+    for field in RANK_DISTRIBUTION_FIELDS:
+        vals = [int(r[field]) for r in rows]
+        out['mean_rank_' + field] = int(mean(vals))
+        out['max_rank_' + field] = max(vals)
     for field in CONSENSUS_STATE_FIELDS:
         values = [int(r[field]) for r in rows]
         if len(set(values)) != 1:

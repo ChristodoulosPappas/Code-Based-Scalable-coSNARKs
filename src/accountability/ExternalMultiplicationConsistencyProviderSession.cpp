@@ -19,9 +19,10 @@ bool ExternalMultiplicationConsistencyProviderSession::Activate(
         return false;
 
     MultiplicationConsistencyProviderAcceptanceResult candidate;
-    if (!run_multiplication_consistency_provider_acceptance(
-            rank, world_size, adapter_, &candidate, comm) ||
-        !candidate.available ||
+    const bool accepted = run_multiplication_consistency_provider_acceptance(
+        rank, world_size, adapter_, &candidate, comm);
+    last_attempt_ = candidate;
+    if (!accepted || !candidate.available ||
         candidate.acceptance_binding == Digest{})
         return false;
 
@@ -43,6 +44,7 @@ bool ExternalMultiplicationConsistencyProviderSession::Activate(
 void ExternalMultiplicationConsistencyProviderSession::Reset() {
     registration_.reset();
     acceptance_ = MultiplicationConsistencyProviderAcceptanceResult{};
+    last_attempt_ = MultiplicationConsistencyProviderAcceptanceResult{};
 }
 
 } // namespace pvia

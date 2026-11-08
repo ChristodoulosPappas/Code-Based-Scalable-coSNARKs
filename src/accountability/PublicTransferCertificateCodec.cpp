@@ -35,6 +35,7 @@ std::vector<u64> encode_public_transfer_blame_certificate(
         certificate.evidence_kind != AuditEvidenceKind::PUBLIC_TRANSFER ||
         !certificate.predecessor_evidence.empty() ||
         !certificate.checkpoint_evidence.empty() ||
+        !certificate.recovery_artifact_words.empty() ||
         certificate.public_proof_words.empty())
         return {};
 

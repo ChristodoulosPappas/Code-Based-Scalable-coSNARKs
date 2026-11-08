@@ -1,4 +1,6 @@
 #include "PublicJudge.hpp"
+#include "Sp1VssRecoveryProofProvider.hpp"
+#include "MultiplicationConsistencyProof.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -144,7 +146,8 @@ bool PublicJudge::VerifyDebug(const BlameCertificate& cert,
         cert.public_proof_system_id != 0 ||
         cert.public_proof_commitment != Digest{} ||
         cert.public_proof_transcript_binding != Digest{} ||
-        !cert.public_proof_words.empty())
+        !cert.public_proof_words.empty() ||
+        !cert.recovery_artifact_words.empty())
         return false;
     if (cert.sid != expected_session_id) return false;
     if (cert.label.sid != cert.sid) return false;
@@ -199,6 +202,242 @@ bool PublicJudge::VerifyDebug(const BlameCertificate& cert,
     if (checkpoint_round != cert.label.round) return false;
 
     return cert.proof_digest == compute_debug_proof_digest(cert);
+}
+
+bool PublicJudge::VerifyRecoveryReceipt(
+    const BlameCertificate& certificate,
+    const std::vector<std::array<uint8_t, 32>>& public_keys,
+    const Digest& externally_pinned_registry_commitment) {
+    if (!certificate.valid || certificate.debug_only ||
+        certificate.evidence_kind != AuditEvidenceKind::PRIVATE_RECOVERY ||
+        certificate.recovery_artifact_words.empty() ||
+        certificate.accused != certificate.label.owner ||
+        externally_pinned_registry_commitment == Digest{})
+        return false;
+
+    const PublicBlameStatement statement =
+        make_public_blame_statement(certificate);
+    if (statement.statement_binding == Digest{} ||
+        statement.statement_binding != certificate.blame_statement_binding)
+        return false;
+    PublicBlameProofArtifact proof;
+    proof.available = true;
+    proof.cryptographically_authenticated = true;
+    proof.proof_system_id = certificate.public_proof_system_id;
+    proof.statement_binding = certificate.blame_statement_binding;
+    proof.proof_commitment = certificate.public_proof_commitment;
+    proof.transcript_binding = certificate.public_proof_transcript_binding;
+    proof.proof_words = certificate.public_proof_words;
+    proof.recovery_proof_system_id = certificate.recovery_proof_system_id;
+    proof.recovery_proof_statement_binding =
+        certificate.recovery_proof_statement_binding;
+    proof.recovery_proof_artifact_commitment =
+        certificate.recovery_proof_artifact_commitment;
+    proof.recovery_proof_statement_words =
+        certificate.recovery_proof_statement_words;
+    proof.recovery_proof_artifact_bytes =
+        certificate.recovery_proof_artifact_bytes;
+    if (!validate_public_blame_proof_artifact(statement, proof) ||
+        certificate.proof_digest != certificate.public_proof_commitment ||
+        certificate.transcript_digest !=
+            certificate.public_proof_transcript_binding)
+        return false;
+
+    const AuthenticatedRecoveryRequest request =
+        make_recovery_request(certificate);
+    AuthenticatedRecoveryArtifact recovery;
+    if (request.request_binding == Digest{} ||
+        !decode_authenticated_recovery_artifact(
+            certificate.recovery_artifact_words, &recovery) ||
+        !validate_recovery_artifact(request, recovery) ||
+        compute_recovery_artifact_binding(recovery) !=
+            certificate.audit_witness_digest ||
+        recovery.accused != OperationRef{
+            certificate.label.owner, certificate.label.object_id} ||
+        recovery.recovery_auth_signer != certificate.label.owner ||
+        recovery.predecessor_root != certificate.predecessor_root ||
+        recovery.checkpoint_root != certificate.checkpoint_root)
+        return false;
+
+    return verify_authenticated_recovery_receipt(
+        request, recovery, public_keys,
+        externally_pinned_registry_commitment);
+}
+
+
+bool PublicJudge::ValidateRecoveryRelationStatement(
+    const BlameCertificate& certificate,
+    const std::vector<u64>& expected_statement_words) {
+    constexpr uint64_t kStatementDomain = 0x5056524350525331ULL;
+    constexpr uint64_t kProofSystemId = 68103ULL;
+    if (!certificate.valid || certificate.debug_only ||
+        certificate.evidence_kind != AuditEvidenceKind::PRIVATE_RECOVERY ||
+        certificate.accused != certificate.label.owner ||
+        certificate.sid == 0 || certificate.label.sid != certificate.sid ||
+        certificate.checkpoint == 0 ||
+        certificate.recovery_proof_system_id != kProofSystemId ||
+        certificate.recovery_proof_statement_binding == Digest{} ||
+        certificate.recovery_proof_artifact_commitment == Digest{} ||
+        certificate.recovery_proof_statement_words.size() != 85 ||
+        expected_statement_words.size() != 85 ||
+        certificate.recovery_proof_statement_words != expected_statement_words ||
+        certificate.recovery_proof_artifact_bytes.empty() ||
+        certificate.recovery_artifact_words.empty())
+        return false;
+
+    const AuthenticatedRecoveryRequest request = make_recovery_request(certificate);
+    AuthenticatedRecoveryArtifact recovery;
+    if (request.request_binding == Digest{} ||
+        !decode_authenticated_recovery_artifact(
+            certificate.recovery_artifact_words, &recovery) ||
+        !validate_recovery_artifact(request, recovery) ||
+        compute_recovery_artifact_binding(recovery) !=
+            certificate.audit_witness_digest ||
+        recovery.accused != OperationRef{
+            certificate.label.owner, certificate.label.object_id} ||
+        recovery.recovery_auth_signer != certificate.label.owner ||
+        recovery.predecessor_root != certificate.predecessor_root ||
+        recovery.checkpoint_root != certificate.checkpoint_root)
+        return false;
+
+    const auto& words = expected_statement_words;
+    if (words[0] != kStatementDomain || words[1] != 1 ||
+        words[2] < 4 || words[2] > 128 ||
+        words[3] >= words[2] || words[3] * 3 >= words[2] ||
+        words[4] >= words[2] || words[4] != certificate.accused ||
+        words[5] == 0 || words[5] > (1ULL << 16) ||
+        words[6] != certificate.sid || words[7] != certificate.checkpoint ||
+        words[8] == 0 || words[9] == 0 ||
+        words[10] != static_cast<u64>(certificate.relation) ||
+        words[11] != static_cast<u64>(certificate.kernel) ||
+        words[12] != recovery.recovery_auth_signer ||
+        words[12] != words[4])
+        return false;
+
+    auto digest_at = [&words](size_t digest_index) {
+        Digest digest{};
+        const size_t offset = 13 + digest_index * 4;
+        if (offset + 4 > words.size()) return digest;
+        for (size_t i = 0; i < 4; ++i) {
+            const uint64_t word = static_cast<uint64_t>(words[offset + i]);
+            for (size_t j = 0; j < 8; ++j)
+                digest.bytes[i * 8 + j] =
+                    static_cast<uint8_t>(word >> (8 * j));
+        }
+        return digest;
+    };
+    std::vector<u64> request_context_words = {
+        request.label.sid,
+        static_cast<u64>(request.label.phase),
+        request.label.round,
+        request.label.owner,
+        static_cast<u64>(request.label.obligation),
+        request.label.object_id,
+        request.checkpoint,
+        static_cast<u64>(request.relation),
+        static_cast<u64>(request.kernel)
+    };
+    append_digest_words(request.expected, request_context_words);
+    append_digest_words(request.actual, request_context_words);
+    append_digest_words(request.residual_commitment, request_context_words);
+    append_digest_words(request.operation_statement_binding, request_context_words);
+    append_digest_words(request.dispute_binding, request_context_words);
+    append_digest_words(request.checkpoint_root, request_context_words);
+    const Digest request_context_binding = hash_words(request_context_words);
+
+    if (digest_at(4) != recovery.recovery_registry_binding ||
+        digest_at(5) != recovery.request_binding ||
+        digest_at(6) != recovery.operation_statement_binding ||
+        digest_at(7) != recovery.dispute_binding ||
+        digest_at(8) != recovery.predecessor_root ||
+        digest_at(9) != recovery.checkpoint_root ||
+        digest_at(10) != recovery.recovery_share_commitment ||
+        digest_at(11) != recovery.recovered_audit_commitment ||
+        digest_at(12) != recovery.recovery_agreement_binding ||
+        digest_at(13) != recovery.recovery_replay_head ||
+        digest_at(14) != recovery.recovery_auth_registry_binding ||
+        digest_at(15) != recovery.authentication_proof_commitment ||
+        digest_at(16) != recovery.recovery_transcript_binding ||
+        digest_at(17) != request_context_binding)
+        return false;
+
+    return true;
+}
+
+
+
+bool PublicJudge::VerifyRecoveryRelationProof(
+    const BlameCertificate& certificate,
+    const std::vector<u64>& expected_statement_words) {
+    if (!ValidateRecoveryRelationStatement(
+            certificate, expected_statement_words))
+        return false;
+    Sp1VssRecoveryProofProvider provider;
+    Sp1VssRecoveryProofReceipt receipt;
+    if (!provider.VerifyArtifactBytes(
+            certificate.recovery_proof_artifact_bytes,
+            expected_statement_words, &receipt))
+        return false;
+    return receipt.available && receipt.proof_verified &&
+        receipt.proof_system_id == certificate.recovery_proof_system_id &&
+        receipt.statement_binding ==
+            certificate.recovery_proof_statement_binding &&
+        receipt.artifact_commitment ==
+            certificate.recovery_proof_artifact_commitment;
+}
+
+bool PublicJudge::VerifyRecoveryProof(
+    const BlameCertificate& certificate,
+    const std::vector<std::array<uint8_t, 32>>& public_keys,
+    const Digest& externally_pinned_registry_commitment,
+    const std::vector<u64>& expected_statement_words) {
+    return VerifyRecoveryReceipt(
+               certificate, public_keys, externally_pinned_registry_commitment) &&
+           VerifyRecoveryRelationProof(certificate, expected_statement_words);
+}
+
+
+// Verifies a collectively signed RS-event summary and a participant's own
+// signed report that its multiplication proof preflight failed. A signer can
+// only self-report: changing the accused identity or the report invalidates
+// the Ed25519 envelope. This is protocol-abort attribution, not a ZK proof of
+// the hidden multiplication inequality.
+bool PublicJudge::VerifyMultiplicationFailureCertificate(
+    const ReferenceMultiplicationFailureCertificate& certificate,
+    const std::vector<std::array<uint8_t, 32>>& public_keys,
+    const Digest& externally_pinned_registry_commitment) {
+    if (externally_pinned_registry_commitment == Digest{} ||
+        public_keys.size() != certificate.event.world_size ||
+        compute_ed25519_registry_commitment(public_keys) !=
+            externally_pinned_registry_commitment ||
+        certificate.registry_commitment !=
+            externally_pinned_registry_commitment ||
+        !validate_reference_multiplication_failure_certificate(certificate))
+        return false;
+    for (const auto& observation : certificate.status_observations) {
+        if (observation.registry_commitment !=
+                externally_pinned_registry_commitment ||
+            !verify_authenticated_mpc_signed_envelope_observation(
+                observation, public_keys,
+                externally_pinned_registry_commitment))
+            return false;
+    }
+    return true;
+}
+
+
+// The serialized overload intentionally has no alternate verification path:
+// strict decoding is followed by the same certificate validator and Ed25519
+// verification used for the in-memory artifact.
+bool PublicJudge::VerifyMultiplicationFailureCertificate(
+    const std::vector<u64>& encoded_certificate,
+    const std::vector<std::array<uint8_t, 32>>& public_keys,
+    const Digest& externally_pinned_registry_commitment) {
+    ReferenceMultiplicationFailureCertificate certificate;
+    return decode_reference_multiplication_failure_certificate(
+               encoded_certificate, &certificate) &&
+        VerifyMultiplicationFailureCertificate(
+            certificate, public_keys, externally_pinned_registry_commitment);
 }
 
 } // namespace pvia

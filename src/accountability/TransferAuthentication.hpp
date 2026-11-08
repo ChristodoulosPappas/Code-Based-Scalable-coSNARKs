@@ -36,6 +36,8 @@ public:
 
     bool Seal(std::array<u64, META_WORDS>* meta,
               const std::vector<u64>& wire_payload) const;
+    bool SealDigest(std::array<u64, META_WORDS>* meta,
+                    const Digest& wire_digest) const;
     bool Verify(const std::array<u64, META_WORDS>& meta,
                 int expected_transport_sender = -1) const;
 

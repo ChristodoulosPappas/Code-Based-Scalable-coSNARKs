@@ -4,6 +4,7 @@
 #include <mpi.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
+#include <dlfcn.h>
 
 #include <algorithm>
 #include <cctype>
@@ -111,6 +112,67 @@ bool verify_ed25519_with_pkey(
     EVP_MD_CTX_free(ctx);
     return ok;
 }
+struct SodiumEd25519VerifyApi {
+    using InitFn = int (*)();
+    using VerifyFn = int (*)(
+        const unsigned char*, const unsigned char*,
+        unsigned long long, const unsigned char*);
+
+    void* handle = nullptr;
+    InitFn init = nullptr;
+    VerifyFn verify = nullptr;
+    bool ready = false;
+
+    SodiumEd25519VerifyApi() {
+        if (std::getenv("PVIA_DISABLE_LIBSODIUM_VERIFY"))
+            return;
+        const char* candidates[] = {
+            "libsodium.so.23", "libsodium.so"};
+        for (const char* name : candidates) {
+            handle = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+            if (handle) break;
+        }
+        if (!handle) return;
+        init = reinterpret_cast<InitFn>(
+            dlsym(handle, "sodium_init"));
+        verify = reinterpret_cast<VerifyFn>(
+            dlsym(handle, "crypto_sign_verify_detached"));
+        if (!init || !verify || init() < 0) {
+            dlclose(handle);
+            handle = nullptr;
+            init = nullptr;
+            verify = nullptr;
+            return;
+        }
+        ready = true;
+    }
+
+    ~SodiumEd25519VerifyApi() {
+        if (handle) dlclose(handle);
+    }
+};
+
+const SodiumEd25519VerifyApi& sodium_ed25519_verify_api() {
+    static const SodiumEd25519VerifyApi api;
+    return api;
+}
+
+bool verify_ed25519_fast(
+    const std::array<uint8_t, 32>& public_key,
+    EVP_PKEY* fallback_pkey,
+    const uint8_t* message, size_t message_size,
+    const std::array<uint8_t, 64>& signature) {
+    const auto& sodium = sodium_ed25519_verify_api();
+    if (sodium.ready) {
+        return sodium.verify(
+                   signature.data(), message,
+                   static_cast<unsigned long long>(message_size),
+                   public_key.data()) == 0;
+    }
+    return verify_ed25519_with_pkey(
+        fallback_pkey, message, message_size, signature);
+}
+
 
 bool verify_ed25519(const std::array<uint8_t, 32>& public_key,
                     const uint8_t* message, size_t message_size,
@@ -452,15 +514,21 @@ Digest Ed25519TransferAuthenticator::PublicKeyId(uint32_t rank) const {
 bool Ed25519TransferAuthenticator::Seal(
     std::array<u64, META_WORDS>* meta,
     const std::vector<u64>& wire_payload) const {
+    return SealDigest(meta, hash_words(wire_payload));
+}
+
+bool Ed25519TransferAuthenticator::SealDigest(
+    std::array<u64, META_WORDS>* meta,
+    const Digest& wire_digest) const {
     if (!ready_ || !meta || (*meta)[0] != META_MAGIC ||
-        rank_ < 0 || static_cast<size_t>(rank_) >= public_key_ids_.size())
+        rank_ < 0 || static_cast<size_t>(rank_) >= public_key_ids_.size() ||
+        wire_digest == Digest{})
         return false;
     (*meta)[META_SCHEMA_INDEX] = META_SCHEMA_VERSION;
     (*meta)[META_AUTH_SIGNER_INDEX] = static_cast<u64>(rank_);
     digest_to_words_local(public_key_ids_[static_cast<size_t>(rank_)],
                           &(*meta)[META_AUTH_KEY_ID_OFFSET]);
 
-    const Digest wire_digest = hash_words(wire_payload);
     digest_to_words_local(wire_digest, &(*meta)[META_AUTH_WIRE_DIGEST_OFFSET]);
     std::fill(meta->begin() + META_AUTH_SIGNATURE_OFFSET, meta->end(), 0ULL);
 
@@ -473,7 +541,7 @@ bool Ed25519TransferAuthenticator::Seal(
         return false;
     std::memcpy(&(*meta)[META_AUTH_SIGNATURE_OFFSET],
                 signature.data(), signature.size());
-    return Verify(*meta, rank_);
+    return true;
 }
 
 bool Ed25519TransferAuthenticator::Verify(
@@ -502,8 +570,9 @@ bool Ed25519TransferAuthenticator::Verify(
     const uint8_t* message = reinterpret_cast<const uint8_t*>(meta.data());
     const size_t message_size =
         static_cast<size_t>(META_AUTH_SIGNATURE_OFFSET) * sizeof(u64);
-    return verify_ed25519_with_pkey(
-        public_pkeys_[signer], message, message_size, signature);
+    return verify_ed25519_fast(
+        public_keys_[signer], public_pkeys_[signer],
+        message, message_size, signature);
 }
 bool Ed25519TransferAuthenticator::SignWords(
     u64 domain, const std::vector<u64>& message,
@@ -537,8 +606,9 @@ bool Ed25519TransferAuthenticator::VerifyWords(
     const uint8_t* bytes =
         reinterpret_cast<const uint8_t*>(preimage.data());
     const size_t byte_count = preimage.size() * sizeof(u64);
-    return verify_ed25519_with_pkey(
-        public_pkeys_[signer], bytes, byte_count, signature);
+    return verify_ed25519_fast(
+        public_keys_[signer], public_pkeys_[signer],
+        bytes, byte_count, signature);
 }
 
 

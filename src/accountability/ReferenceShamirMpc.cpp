@@ -1,6 +1,10 @@
 #include "ReferenceShamirMpc.hpp"
 #include "ReferenceBivariateVss.hpp"
+#include "AuthenticatedMpcAbortEvidence.hpp"
+#include "PublicJudge.hpp"
+#include "TransferAuthentication.hpp"
 #include "MultiplicationConsistencySharingWitness.hpp"
+#include "MultiplicationConsistencyWitnessRelation.hpp"
 #include "ProtocolTrafficMetrics.hpp"
 
 #include <openssl/rand.h>
@@ -8,6 +12,8 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <utility>
@@ -21,11 +27,17 @@ constexpr u64 COMMIT_DOMAIN = 0x50564352434f4d4dULL;      // PVCRCOMM
 constexpr u64 COMMIT_TRANSCRIPT_DOMAIN = 0x5056435254524e53ULL; // PVCRTRNS
 constexpr u64 OPEN_REVEAL_DOMAIN = 0x50564f50454e4352ULL; // PVOPENCR
 constexpr u64 OPEN_RESULT_DOMAIN = 0x50564f50454e5253ULL; // PVOPENRS
+constexpr u64 DEGREE2T_OPEN_REVEAL_DOMAIN =
+    0x50564432544f504eULL; // PVD2TOPN
+constexpr u64 DEGREE2T_OPEN_RESULT_DOMAIN =
+    0x5056443254524553ULL; // PVD2TRES
 constexpr u64 SEED_REVEAL_DOMAIN = 0x5056534545444352ULL; // PVSEEDCR
 constexpr u64 MULTIPLY_TRANSCRIPT_DOMAIN = 0x50564d554c545452ULL; // PVMULTTR
 constexpr u64 ZERO_TEST_TRANSCRIPT_DOMAIN = 0x50565a45524f5452ULL; // PVZEROTR
 constexpr u64 LOCAL_SUM_TRANSCRIPT_DOMAIN = 0x50564c53554d5452ULL; // PVLSUMTR
 constexpr u64 RANDOM_SHARE_TRANSCRIPT_DOMAIN = 0x5056524e44534852ULL; // PVRNDSHR
+constexpr u64 RANDOM_MASK_POOL_TRANSCRIPT_DOMAIN =
+    0x5056524d534b504cULL; // PVRMSKPL
 constexpr u64 MULTIPLY_CONSISTENCY_REQUEST_DOMAIN =
     0x50564d554c435251ULL; // PVMULCRQ
 constexpr u64 STRONG_ZERO_TEST_TRANSCRIPT_DOMAIN =
@@ -40,21 +52,29 @@ constexpr u64 AUTH_KIND_MULTIPLY_VSS = 0x4d554c5653533031ULL; // MULVSS01
 constexpr u64 AUTH_KIND_RANDOM_MODE = 0x524e444d4f444531ULL; // RNDMODE1
 constexpr u64 AUTH_KIND_RANDOM_READY = 0x524e445245414431ULL; // RNDREAD1
 constexpr u64 AUTH_KIND_MULTIPLY_MODE = 0x4d554c4d4f444531ULL; // MULMODE1
+constexpr u64 RS_PRODUCT_PARITY_DOMAIN = 0x5253504152495459ULL; // RSPARITY
 constexpr u64 AUTH_KIND_PROOF_MODE = 0x5052464d4f444531ULL; // PRFMODE1
 constexpr u64 AUTH_KIND_PROOF_READY = 0x5052465245414431ULL; // PRFREAD1
 constexpr u64 AUTH_KIND_PROOF_CAP = 0x5052464341503031ULL; // PRFCAP01
 constexpr u64 AUTH_KIND_CONTEXT_READY = 0x4354585245414431ULL; // CTXREAD1
 constexpr u64 AUTH_KIND_REQUEST_BINDING = 0x525142494e443031ULL; // RQBIND01
 constexpr u64 AUTH_KIND_PROVER_STATUS = 0x5052565354415431ULL; // PRVSTAT1
+constexpr u64 AUTH_KIND_PROVER_PREFLIGHT = 0x5052565052464c31ULL; // PRVPRFL1
 constexpr u64 AUTH_KIND_PROOF_BROADCAST = 0x5052464252435431ULL; // PRFBRCT1
+constexpr u64 AUTH_KIND_PROOF_BATCH_SIZE = 0x5052464253495a31ULL; // PRFBSIZ1
+constexpr u64 AUTH_KIND_PROOF_BATCH_DATA = 0x5052464244415431ULL; // PRFBDAT1
+constexpr u64 AUTH_KIND_PROOF_STATEMENTS = 0x5052465354415431ULL; // PRFSTAT1
 constexpr u64 AUTH_KIND_VERIFY_AGREEMENT = 0x5652464147524531ULL; // VRFAGRE1
 constexpr u64 AUTH_KIND_PROOF_SET = 0x5052465345543031ULL; // PRFSET01
-constexpr u64 AUTH_KIND_ZERO_SECRET_READY = 0x5a53524541445931ULL; // ZSREADY1
-constexpr u64 AUTH_KIND_ZERO_SECRET_BINDING = 0x5a5342494e443031ULL; // ZSBIND01
-constexpr u64 AUTH_KIND_ZERO_CONTEXT_READY = 0x5a43524541445931ULL; // ZCREADY1
-constexpr u64 AUTH_KIND_ZERO_CONTEXT_BINDING = 0x5a4342494e443031ULL; // ZCBIND01
-constexpr u64 AUTH_KIND_ZERO_RANDOM_BINDING = 0x5a5242494e443031ULL; // ZRBIND01
-constexpr u64 AUTH_KIND_ZERO_RANDOM_TRANSCRIPT = 0x5a5254524e533031ULL; // ZRTRNS01
+constexpr u64 AUTH_KIND_FAILURE_CERT_VERIFY =
+    0x4641494c56455249ULL; // FAILVERI
+constexpr u64 AUTH_KIND_FAILURE_CERT_BINDING =
+    0x4641494c42494e44ULL; // FAILBIND
+constexpr u64 AUTH_KIND_ZERO_PREFLIGHT_READY = 0x5a50524652445931ULL; // ZPRFRDY1
+constexpr u64 AUTH_KIND_ZERO_PREFLIGHT_BINDING = 0x5a50524642494e31ULL; // ZPRFBIN1
+constexpr u64 AUTH_KIND_ZERO_RANDOM_PAIR = 0x5a524e4450414952ULL; // ZRNDPAIR
+constexpr u64 ZERO_PREFLIGHT_PAIR_DOMAIN = 0x50565a5052465041ULL; // PVZPRFPA
+constexpr u64 ZERO_RANDOM_PAIR_DOMAIN = 0x50565a524e445041ULL; // PVZRNDPA
 constexpr u64 AUTH_KIND_DIRECT_SHAPE = 0x4453484150453031ULL; // DSHAPE01
 constexpr u64 AUTH_KIND_DIRECT_SHAPE_READY = 0x4453485244593031ULL; // DSHRDY01
 constexpr u64 AUTH_KIND_DIRECT_DEALER_STATUS = 0x4444535441543031ULL; // DDSTAT01
@@ -144,6 +164,13 @@ bool ReferenceShamirMpc::SetAuthenticatedTransport(
         transport_sid_ = 0;
         transport_checkpoint_ = 0;
         transport_sequence_ = 1;
+        passive_random_mode_cached_ = false;
+        passive_random_mode_binding_ = Digest{};
+        passive_multiply_mode_cached_ = false;
+        passive_multiply_mode_binding_ = Digest{};
+        passive_random_mask_pool_.clear();
+        passive_random_mask_bindings_.clear();
+        passive_random_mask_next_ = 0;
         return true;
     }
     if (sid == 0 || checkpoint == 0 ||
@@ -153,6 +180,13 @@ bool ReferenceShamirMpc::SetAuthenticatedTransport(
     transport_sid_ = sid;
     transport_checkpoint_ = checkpoint;
     transport_sequence_ = 1;
+    passive_random_mode_cached_ = false;
+    passive_random_mode_binding_ = Digest{};
+    passive_multiply_mode_cached_ = false;
+    passive_multiply_mode_binding_ = Digest{};
+    passive_random_mask_pool_.clear();
+    passive_random_mask_bindings_.clear();
+    passive_random_mask_next_ = 0;
     return true;
 }
 
@@ -637,57 +671,86 @@ bool ReferenceShamirMpc::ShareVectorFromDealer(
     int dealer, const std::vector<F>& dealer_plaintext,
     std::vector<F>* local_shares) const {
     return ShareVectorFromDealerInternal(
-        dealer, dealer_plaintext, local_shares, nullptr);
+        dealer, dealer_plaintext, local_shares, nullptr, 0);
+}
+
+bool ReferenceShamirMpc::ShareVectorFromDealerKnownSize(
+    int dealer, const std::vector<F>& dealer_plaintext,
+    size_t authenticated_element_count,
+    std::vector<F>* local_shares) const {
+    if (authenticated_element_count == 0 ||
+        !authenticated_transport_available())
+        return false;
+    return ShareVectorFromDealerInternal(
+        dealer, dealer_plaintext, local_shares, nullptr,
+        authenticated_element_count);
 }
 
 bool ReferenceShamirMpc::ShareVectorFromDealerInternal(
     int dealer, const std::vector<F>& dealer_plaintext,
-    std::vector<F>* local_shares, Digest* transport_binding) const {
+    std::vector<F>* local_shares, Digest* transport_binding,
+    size_t authenticated_element_count) const {
     if (!valid() || !local_shares || dealer < 0 || dealer >= world_size_)
         return false;
     if (transport_binding) *transport_binding = Digest{};
     const bool authenticated = authenticated_transport_available();
     std::vector<Digest> auth_bindings;
 
-    u64 element_count = rank_ == dealer
-        ? static_cast<u64>(dealer_plaintext.size()) : 0ULL;
-    if (authenticated) {
-        std::vector<u64> shape_payload;
-        if (rank_ == dealer) shape_payload = {element_count};
-        std::vector<u64> received_shape;
-        Digest binding{};
-        if (!authenticated_exchange_->BroadcastWords(
-                NextTransportContext(AUTH_MPC_PROTOCOL_DOMAIN,
-                    AUTH_KIND_DIRECT_SHAPE, static_cast<uint64_t>(dealer)),
-                dealer, shape_payload, &received_shape, &binding) ||
-            received_shape.size() != 1 || binding == Digest{})
-            return false;
-        element_count = received_shape.front();
-        auth_bindings.push_back(binding);
-    } else {
-        MPI_Bcast(&element_count, 1, MPI_UINT64_T, dealer, comm_);
-        record_control_broadcast(sizeof(u64), dealer, rank_, world_size_);
+    const bool shape_already_authenticated =
+        authenticated_element_count != 0;
+    if (shape_already_authenticated && !authenticated)
+        return false;
+
+    u64 element_count = shape_already_authenticated
+        ? static_cast<u64>(authenticated_element_count)
+        : (rank_ == dealer
+            ? static_cast<u64>(dealer_plaintext.size()) : 0ULL);
+    if (!shape_already_authenticated) {
+        if (authenticated) {
+            std::vector<u64> shape_payload;
+            if (rank_ == dealer) shape_payload = {element_count};
+            std::vector<u64> received_shape;
+            Digest binding{};
+            if (!authenticated_exchange_->BroadcastWords(
+                    NextTransportContext(
+                        AUTH_MPC_PROTOCOL_DOMAIN,
+                        AUTH_KIND_DIRECT_SHAPE,
+                        static_cast<uint64_t>(dealer)),
+                    dealer, shape_payload, &received_shape, &binding) ||
+                received_shape.size() != 1 || binding == Digest{})
+                return false;
+            element_count = received_shape.front();
+            auth_bindings.push_back(binding);
+        } else {
+            MPI_Bcast(&element_count, 1, MPI_UINT64_T, dealer, comm_);
+            record_control_broadcast(
+                sizeof(u64), dealer, rank_, world_size_);
+        }
     }
+
     const bool local_shape_ok = element_count > 0 &&
         element_count <= static_cast<u64>(
             std::numeric_limits<size_t>::max() / 2) &&
         (rank_ != dealer || dealer_plaintext.size() == element_count);
-    if (authenticated) {
-        Digest binding{};
-        if (!CollectiveAllTrue(
-                local_shape_ok, AUTH_KIND_DIRECT_SHAPE_READY,
-                static_cast<uint64_t>(dealer), &binding))
+    if (!shape_already_authenticated) {
+        if (authenticated) {
+            Digest binding{};
+            if (!CollectiveAllTrue(
+                    local_shape_ok, AUTH_KIND_DIRECT_SHAPE_READY,
+                    static_cast<uint64_t>(dealer), &binding))
+                return false;
+            auth_bindings.push_back(binding);
+        } else if (!all_ranks_true(
+                       local_shape_ok ? 1 : 0, comm_)) {
             return false;
-        auth_bindings.push_back(binding);
-    } else if (!all_ranks_true(local_shape_ok ? 1 : 0, comm_)) {
-        return false;
+        }
     }
 
     const size_t count = static_cast<size_t>(element_count);
     const size_t words_per_rank = count * 2;
     std::vector<u64> send_words;
-    int dealer_random_ok = 1;
-    if (rank_ == dealer) {
+    int dealer_random_ok = local_shape_ok ? 1 : 0;
+    if (rank_ == dealer && dealer_random_ok) {
         if (words_per_rank > std::numeric_limits<size_t>::max() /
                                  static_cast<size_t>(world_size_)) {
             dealer_random_ok = 0;
@@ -818,6 +881,128 @@ bool ReferenceShamirMpc::RandomSharedFieldWithProvenance(
         local_share, provenance, transcript_binding);
 }
 
+bool ReferenceShamirMpc::PreparePassiveRandomMasks(
+    size_t count) const {
+    if (count == 0) return true;
+    if (!valid() || !authenticated_transport_available() ||
+        !detectable_degree_reduction_available())
+        return false;
+
+    const size_t available =
+        passive_random_mask_pool_.size() >= passive_random_mask_next_
+            ? passive_random_mask_pool_.size() -
+                  passive_random_mask_next_
+            : 0;
+    if (available >= count) return true;
+
+    // A pool is prepared only at a batch-failure boundary, before recursive
+    // localization starts.  Discard any exhausted prefix rather than mixing
+    // masks from distinct preparation transcripts.
+    passive_random_mask_pool_.clear();
+    passive_random_mask_bindings_.clear();
+    passive_random_mask_next_ = 0;
+
+    u64 agreed_provenance_mode = 0;
+    Digest mode_binding{};
+    if (passive_random_mode_cached_) {
+        mode_binding = passive_random_mode_binding_;
+    } else {
+        if (!CollectiveSameWord(
+                0ULL, AUTH_KIND_RANDOM_MODE, 0,
+                &agreed_provenance_mode, &mode_binding) ||
+            agreed_provenance_mode != 0 ||
+            mode_binding == Digest{})
+            return false;
+        passive_random_mode_cached_ = true;
+        passive_random_mode_binding_ = mode_binding;
+    }
+
+    const int random_contributor_count = threshold_ + 1;
+    if (random_contributor_count <= 0 ||
+        random_contributor_count > world_size_)
+        return false;
+
+    const bool contributes_random =
+        rank_ < random_contributor_count;
+    std::vector<F> own_random(count, F(0));
+    const bool local_random_ok =
+        !contributes_random ||
+        RandomFieldVector(count, &own_random);
+    Digest random_ready_binding{};
+    if (!CollectiveAllTrue(
+            local_random_ok, AUTH_KIND_RANDOM_READY,
+            static_cast<uint64_t>(count),
+            &random_ready_binding))
+        return false;
+
+    ReferenceBivariateVss vss(
+        rank_, world_size_, threshold_, comm_);
+    if (!vss.valid()) return false;
+
+    std::vector<F> dealer_major_shares;
+    std::vector<ReferenceVssReceipt> receipts;
+    const AuthenticatedMpcMessageContext batch_context =
+        NextTransportContext(
+            AUTH_MPC_PROTOCOL_DOMAIN,
+            AUTH_KIND_RANDOM_VSS,
+            static_cast<uint64_t>(count));
+    if (!vss.ShareVectorsFromPrefixDealersAuthenticated(
+            random_contributor_count, own_random, count,
+            &dealer_major_shares, &receipts,
+            *authenticated_exchange_, batch_context,
+            nullptr) ||
+        dealer_major_shares.size() !=
+            static_cast<size_t>(random_contributor_count) * count ||
+        receipts.size() !=
+            static_cast<size_t>(random_contributor_count))
+        return false;
+
+    passive_random_mask_pool_.assign(count, F(0));
+    passive_random_mask_bindings_.assign(count, Digest{});
+    for (int dealer = 0;
+         dealer < random_contributor_count; ++dealer) {
+        const auto& receipt =
+            receipts[static_cast<size_t>(dealer)];
+        if (!receipt.available || !receipt.consistent ||
+            receipt.dealer != dealer ||
+            receipt.element_count != count ||
+            receipt.transcript_binding == Digest{})
+            return false;
+        for (size_t element = 0;
+             element < count; ++element) {
+            passive_random_mask_pool_[element] +=
+                dealer_major_shares[
+                    static_cast<size_t>(dealer) * count +
+                    element];
+        }
+    }
+
+    for (size_t element = 0;
+         element < count; ++element) {
+        std::vector<u64> words = {
+            RANDOM_MASK_POOL_TRANSCRIPT_DOMAIN,
+            static_cast<u64>(world_size_),
+            static_cast<u64>(threshold_),
+            static_cast<u64>(random_contributor_count),
+            static_cast<u64>(count),
+            static_cast<u64>(element)};
+        append_digest_words(
+            authenticated_transport_capability_binding(),
+            &words);
+        append_digest_words(mode_binding, &words);
+        append_digest_words(random_ready_binding, &words);
+        for (const auto& receipt : receipts)
+            append_digest_words(
+                receipt.transcript_binding, &words);
+        passive_random_mask_bindings_[element] =
+            hash_words(words);
+        if (passive_random_mask_bindings_[element] ==
+            Digest{})
+            return false;
+    }
+    return true;
+}
+
 bool ReferenceShamirMpc::RandomSharedFieldInternal(
     F* local_share, ReferenceLinearSharingProvenance* provenance,
     Digest* transcript_binding) const {
@@ -825,12 +1010,58 @@ bool ReferenceShamirMpc::RandomSharedFieldInternal(
     const u64 local_provenance_mode = provenance ? 1ULL : 0ULL;
     u64 agreed_provenance_mode = 0;
     Digest mode_binding{};
-    if (!CollectiveSameWord(local_provenance_mode, AUTH_KIND_RANDOM_MODE, 0,
-            &agreed_provenance_mode, &mode_binding))
+    if (!provenance && authenticated_transport_available() &&
+        passive_random_mode_cached_) {
+        agreed_provenance_mode = 0;
+        mode_binding = passive_random_mode_binding_;
+    } else {
+        if (!CollectiveSameWord(
+                local_provenance_mode, AUTH_KIND_RANDOM_MODE, 0,
+                &agreed_provenance_mode, &mode_binding))
+            return false;
+        if (!provenance && authenticated_transport_available() &&
+            agreed_provenance_mode == 0 && mode_binding != Digest{}) {
+            passive_random_mode_cached_ = true;
+            passive_random_mode_binding_ = mode_binding;
+        }
+    }
+    if (agreed_provenance_mode != local_provenance_mode)
         return false;
 
+    if (!provenance &&
+        passive_random_mask_next_ <
+            passive_random_mask_pool_.size()) {
+        const size_t index = passive_random_mask_next_++;
+        if (index >= passive_random_mask_bindings_.size() ||
+            passive_random_mask_bindings_[index] == Digest{})
+            return false;
+        *local_share =
+            passive_random_mask_pool_[index];
+        if (transcript_binding)
+            *transcript_binding =
+                passive_random_mask_bindings_[index];
+        if (passive_random_mask_next_ ==
+            passive_random_mask_pool_.size()) {
+            passive_random_mask_pool_.clear();
+            passive_random_mask_bindings_.clear();
+            passive_random_mask_next_ = 0;
+        }
+        return true;
+    }
+
+    // A random shared secret only needs one honest random contribution.
+    // Under the reference 3t<n setting, a fixed set of t+1 contributors
+    // necessarily contains an honest party against any static corruption set
+    // of size at most t.  Restricting random dealers to this set avoids n
+    // independent VSS sharings on every random-mask generation.
+    const int random_contributor_count = threshold_ + 1;
+    if (random_contributor_count <= 0 ||
+        random_contributor_count > world_size_)
+        return false;
+    const bool contributes_random = rank_ < random_contributor_count;
     F own_random(0);
-    const bool local_random_ok = RandomField(&own_random);
+    const bool local_random_ok =
+        !contributes_random || RandomField(&own_random);
     Digest random_ready_binding{};
     if (!CollectiveAllTrue(local_random_ok, AUTH_KIND_RANDOM_READY, 0,
             &random_ready_binding))
@@ -844,7 +1075,8 @@ bool ReferenceShamirMpc::RandomSharedFieldInternal(
         provenance ? 1ULL : 0ULL,
         authenticated_transport_available() ? 1ULL : 0ULL,
         static_cast<u64>(world_size_),
-        static_cast<u64>(threshold_)};
+        static_cast<u64>(threshold_),
+        static_cast<u64>(random_contributor_count)};
     if (authenticated_transport_available()) {
         append_digest_words(authenticated_transport_capability_binding(),
                             &transcript_words);
@@ -854,52 +1086,94 @@ bool ReferenceShamirMpc::RandomSharedFieldInternal(
     F sum(0);
     std::vector<ReferenceLinearSharingSource> sources;
     if (provenance)
-        sources.reserve(static_cast<size_t>(world_size_));
+        sources.reserve(static_cast<size_t>(random_contributor_count));
     if (use_vss) {
         ReferenceBivariateVss vss(rank_, world_size_, threshold_, comm_);
         if (!vss.valid()) return false;
-        for (int dealer = 0; dealer < world_size_; ++dealer) {
-            std::vector<F> plaintext;
-            if (rank_ == dealer) plaintext.push_back(own_random);
-            std::vector<F> shares;
-            ReferenceVssReceipt receipt;
-            ReferenceVssLocalWitness local_witness;
-            bool shared = false;
-            if (authenticated_transport_available()) {
-                const AuthenticatedMpcMessageContext vss_context =
-                    NextTransportContext(AUTH_MPC_PROTOCOL_DOMAIN,
-                        AUTH_KIND_RANDOM_VSS, static_cast<uint64_t>(dealer));
-                shared = vss.ShareVectorFromDealerAuthenticated(
-                    dealer, plaintext, &shares, &receipt,
-                    *authenticated_exchange_, vss_context, nullptr,
-                    provenance ? &local_witness : nullptr);
-            } else {
-                shared = provenance
+        if (authenticated_transport_available()) {
+            std::vector<F> batch_shares;
+            std::vector<ReferenceVssReceipt> batch_receipts;
+            std::vector<ReferenceVssLocalWitness> batch_witnesses;
+            const AuthenticatedMpcMessageContext batch_context =
+                NextTransportContext(
+                    AUTH_MPC_PROTOCOL_DOMAIN, AUTH_KIND_RANDOM_VSS, 0);
+            if (!vss.ShareScalarsFromPrefixDealersAuthenticated(
+                    random_contributor_count, own_random,
+                    &batch_shares, &batch_receipts,
+                    *authenticated_exchange_, batch_context,
+                    provenance ? &batch_witnesses : nullptr) ||
+                batch_shares.size() !=
+                    static_cast<size_t>(random_contributor_count) ||
+                batch_receipts.size() !=
+                    static_cast<size_t>(random_contributor_count) ||
+                (provenance && batch_witnesses.size() !=
+                    static_cast<size_t>(random_contributor_count)))
+                return false;
+
+            for (int dealer = 0;
+                 dealer < random_contributor_count; ++dealer) {
+                const auto& receipt =
+                    batch_receipts[static_cast<size_t>(dealer)];
+                if (!receipt.available || !receipt.consistent ||
+                    receipt.dealer != dealer ||
+                    receipt.transcript_binding == Digest{})
+                    return false;
+                sum += batch_shares[static_cast<size_t>(dealer)];
+                transcript_words.push_back(static_cast<u64>(dealer));
+                append_digest_words(
+                    receipt.transcript_binding, &transcript_words);
+                if (provenance) {
+                    auto& local_witness =
+                        batch_witnesses[static_cast<size_t>(dealer)];
+                    if (!validate_reference_vss_local_witness(local_witness) ||
+                        local_witness.transcript_binding !=
+                            receipt.transcript_binding)
+                        return false;
+                    ReferenceLinearSharingSource source;
+                    source.sharing_binding = receipt.transcript_binding;
+                    source.element_coefficients = {F(1)};
+                    source.local_witness = std::move(local_witness);
+                    sources.push_back(std::move(source));
+                }
+            }
+        } else {
+            for (int dealer = 0;
+                 dealer < random_contributor_count; ++dealer) {
+                std::vector<F> plaintext;
+                if (rank_ == dealer) plaintext.push_back(own_random);
+                std::vector<F> shares;
+                ReferenceVssReceipt receipt;
+                ReferenceVssLocalWitness local_witness;
+                const bool shared = provenance
                     ? vss.ShareVectorFromDealerWithLocalWitness(
-                        dealer, plaintext, &shares, &receipt, &local_witness)
+                        dealer, plaintext, &shares, &receipt,
+                        &local_witness)
                     : vss.ShareVectorFromDealer(
                         dealer, plaintext, &shares, &receipt);
-            }
-            if (!shared || shares.size() != 1 || !receipt.available ||
-                !receipt.consistent || receipt.transcript_binding == Digest{})
-                return false;
-            sum += shares.front();
-            transcript_words.push_back(static_cast<u64>(dealer));
-            append_digest_words(receipt.transcript_binding, &transcript_words);
-            if (provenance) {
-                if (!validate_reference_vss_local_witness(local_witness) ||
-                    local_witness.transcript_binding !=
-                        receipt.transcript_binding)
+                if (!shared || shares.size() != 1 ||
+                    !receipt.available || !receipt.consistent ||
+                    receipt.transcript_binding == Digest{})
                     return false;
-                ReferenceLinearSharingSource source;
-                source.sharing_binding = receipt.transcript_binding;
-                source.element_coefficients = {F(1)};
-                source.local_witness = std::move(local_witness);
-                sources.push_back(std::move(source));
+                sum += shares.front();
+                transcript_words.push_back(static_cast<u64>(dealer));
+                append_digest_words(
+                    receipt.transcript_binding, &transcript_words);
+                if (provenance) {
+                    if (!validate_reference_vss_local_witness(local_witness) ||
+                        local_witness.transcript_binding !=
+                            receipt.transcript_binding)
+                        return false;
+                    ReferenceLinearSharingSource source;
+                    source.sharing_binding = receipt.transcript_binding;
+                    source.element_coefficients = {F(1)};
+                    source.local_witness = std::move(local_witness);
+                    sources.push_back(std::move(source));
+                }
             }
         }
     } else {
-        for (int dealer = 0; dealer < world_size_; ++dealer) {
+        for (int dealer = 0;
+             dealer < random_contributor_count; ++dealer) {
             F contribution_share(0);
             const F contribution = rank_ == dealer ? own_random : F(0);
             Digest direct_share_binding{};
@@ -959,6 +1233,112 @@ Digest ReferenceShamirMpc::multiplication_consistency_capability_binding() const
     return capabilities.capability_binding;
 }
 
+bool ReferenceShamirMpc::ShareLocalSum(
+    const F& local_contribution, F* local_share,
+    Digest* linear_binding,
+    Digest* transcript_binding) const {
+    if (!valid() || !local_share || !linear_binding ||
+        !detectable_degree_reduction_available())
+        return false;
+
+    ReferenceBivariateVss vss(rank_, world_size_, threshold_, comm_);
+    if (!vss.valid()) return false;
+
+    F sum(0);
+    std::vector<ReferenceLinearSharingSource> binding_sources;
+    binding_sources.reserve(static_cast<size_t>(world_size_));
+    std::vector<u64> transcript_words = {
+        LOCAL_SUM_TRANSCRIPT_DOMAIN,
+        authenticated_transport_available() ? 1ULL : 0ULL,
+        static_cast<u64>(world_size_),
+        static_cast<u64>(threshold_)};
+    if (authenticated_transport_available()) {
+        append_digest_words(
+            authenticated_transport_capability_binding(),
+            &transcript_words);
+
+        std::vector<F> batch_shares;
+        std::vector<ReferenceVssReceipt> batch_receipts;
+        const AuthenticatedMpcMessageContext batch_context =
+            NextTransportContext(
+                AUTH_MPC_PROTOCOL_DOMAIN,
+                AUTH_KIND_LOCAL_SUM_VSS, 0);
+        if (!vss.ShareScalarsFromPrefixDealersAuthenticated(
+                world_size_, local_contribution,
+                &batch_shares, &batch_receipts,
+                *authenticated_exchange_, batch_context,
+                nullptr) ||
+            batch_shares.size() !=
+                static_cast<size_t>(world_size_) ||
+            batch_receipts.size() !=
+                static_cast<size_t>(world_size_))
+            return false;
+
+        for (int dealer = 0; dealer < world_size_; ++dealer) {
+            const auto& receipt =
+                batch_receipts[static_cast<size_t>(dealer)];
+            if (!receipt.available || !receipt.consistent ||
+                receipt.dealer != dealer ||
+                receipt.transcript_binding == Digest{})
+                return false;
+
+            sum += batch_shares[static_cast<size_t>(dealer)];
+            ReferenceLinearSharingSource source;
+            source.sharing_binding = receipt.transcript_binding;
+            source.element_coefficients = {F(1)};
+            binding_sources.push_back(std::move(source));
+
+            transcript_words.push_back(
+                static_cast<u64>(dealer));
+            append_digest_words(
+                receipt.transcript_binding,
+                &transcript_words);
+        }
+    } else {
+        for (int dealer = 0; dealer < world_size_; ++dealer) {
+            std::vector<F> plaintext;
+            if (rank_ == dealer)
+                plaintext.push_back(local_contribution);
+            std::vector<F> shares;
+            ReferenceVssReceipt receipt;
+            if (!vss.ShareVectorFromDealer(
+                    dealer, plaintext, &shares, &receipt) ||
+                shares.size() != 1 ||
+                !receipt.available || !receipt.consistent ||
+                receipt.dealer != dealer ||
+                receipt.transcript_binding == Digest{})
+                return false;
+
+            sum += shares.front();
+            ReferenceLinearSharingSource source;
+            source.sharing_binding = receipt.transcript_binding;
+            source.element_coefficients = {F(1)};
+            binding_sources.push_back(std::move(source));
+
+            transcript_words.push_back(
+                static_cast<u64>(dealer));
+            append_digest_words(
+                receipt.transcript_binding,
+                &transcript_words);
+        }
+    }
+
+    const Digest binding =
+        compute_reference_linear_sharing_binding(
+            binding_sources);
+    if (binding == Digest{}) return false;
+
+    *local_share = sum;
+    *linear_binding = binding;
+    append_digest_words(binding, &transcript_words);
+    if (transcript_binding) {
+        *transcript_binding = hash_words(transcript_words);
+        if (*transcript_binding == Digest{})
+            return false;
+    }
+    return true;
+}
+
 bool ReferenceShamirMpc::ShareLocalSumWithProvenance(
     const F& local_contribution, F* local_share,
     ReferenceLinearSharingProvenance* provenance,
@@ -984,43 +1364,77 @@ bool ReferenceShamirMpc::ShareLocalSumWithProvenance(
             authenticated_transport_capability_binding(), &transcript_words);
     }
 
-    for (int dealer = 0; dealer < world_size_; ++dealer) {
-        std::vector<F> plaintext;
-        if (rank_ == dealer)
-            plaintext.push_back(local_contribution);
-        std::vector<F> shares;
-        ReferenceVssReceipt receipt;
-        ReferenceVssLocalWitness local_witness;
-        bool shared = false;
-        if (authenticated_transport_available()) {
-            const AuthenticatedMpcMessageContext vss_context =
-                NextTransportContext(
-                    AUTH_MPC_PROTOCOL_DOMAIN,
-                    AUTH_KIND_LOCAL_SUM_VSS,
-                    static_cast<uint64_t>(dealer));
-            shared = vss.ShareVectorFromDealerAuthenticated(
-                dealer, plaintext, &shares, &receipt,
-                *authenticated_exchange_, vss_context,
-                nullptr, &local_witness);
-        } else {
-            shared = vss.ShareVectorFromDealerWithLocalWitness(
-                dealer, plaintext, &shares, &receipt, &local_witness);
-        }
-        if (!shared || shares.size() != 1 || !receipt.available ||
-            !receipt.consistent || receipt.transcript_binding == Digest{} ||
-            !validate_reference_vss_local_witness(local_witness) ||
-            local_witness.transcript_binding != receipt.transcript_binding)
+    if (authenticated_transport_available()) {
+        std::vector<F> batch_shares;
+        std::vector<ReferenceVssReceipt> batch_receipts;
+        std::vector<ReferenceVssLocalWitness> batch_witnesses;
+        const AuthenticatedMpcMessageContext batch_context =
+            NextTransportContext(
+                AUTH_MPC_PROTOCOL_DOMAIN, AUTH_KIND_LOCAL_SUM_VSS, 0);
+        if (!vss.ShareScalarsFromPrefixDealersAuthenticated(
+                world_size_, local_contribution,
+                &batch_shares, &batch_receipts,
+                *authenticated_exchange_, batch_context,
+                &batch_witnesses) ||
+            batch_shares.size() != static_cast<size_t>(world_size_) ||
+            batch_receipts.size() != static_cast<size_t>(world_size_) ||
+            batch_witnesses.size() != static_cast<size_t>(world_size_))
             return false;
 
-        sum += shares.front();
-        ReferenceLinearSharingSource source;
-        source.sharing_binding = receipt.transcript_binding;
-        source.element_coefficients = {F(1)};
-        source.local_witness = std::move(local_witness);
-        sources.push_back(std::move(source));
+        for (int dealer = 0; dealer < world_size_; ++dealer) {
+            const auto& receipt =
+                batch_receipts[static_cast<size_t>(dealer)];
+            auto& local_witness =
+                batch_witnesses[static_cast<size_t>(dealer)];
+            if (!receipt.available || !receipt.consistent ||
+                receipt.dealer != dealer ||
+                receipt.transcript_binding == Digest{} ||
+                !validate_reference_vss_local_witness(local_witness) ||
+                local_witness.transcript_binding !=
+                    receipt.transcript_binding)
+                return false;
 
-        transcript_words.push_back(static_cast<u64>(dealer));
-        append_digest_words(receipt.transcript_binding, &transcript_words);
+            sum += batch_shares[static_cast<size_t>(dealer)];
+            ReferenceLinearSharingSource source;
+            source.sharing_binding = receipt.transcript_binding;
+            source.element_coefficients = {F(1)};
+            source.local_witness = std::move(local_witness);
+            sources.push_back(std::move(source));
+
+            transcript_words.push_back(static_cast<u64>(dealer));
+            append_digest_words(
+                receipt.transcript_binding, &transcript_words);
+        }
+    } else {
+        for (int dealer = 0; dealer < world_size_; ++dealer) {
+            std::vector<F> plaintext;
+            if (rank_ == dealer)
+                plaintext.push_back(local_contribution);
+            std::vector<F> shares;
+            ReferenceVssReceipt receipt;
+            ReferenceVssLocalWitness local_witness;
+            if (!vss.ShareVectorFromDealerWithLocalWitness(
+                    dealer, plaintext, &shares, &receipt,
+                    &local_witness) ||
+                shares.size() != 1 || !receipt.available ||
+                !receipt.consistent ||
+                receipt.transcript_binding == Digest{} ||
+                !validate_reference_vss_local_witness(local_witness) ||
+                local_witness.transcript_binding !=
+                    receipt.transcript_binding)
+                return false;
+
+            sum += shares.front();
+            ReferenceLinearSharingSource source;
+            source.sharing_binding = receipt.transcript_binding;
+            source.element_coefficients = {F(1)};
+            source.local_witness = std::move(local_witness);
+            sources.push_back(std::move(source));
+
+            transcript_words.push_back(static_cast<u64>(dealer));
+            append_digest_words(
+                receipt.transcript_binding, &transcript_words);
+        }
     }
 
     if (!build_reference_linear_sharing_provenance(
@@ -1036,12 +1450,79 @@ bool ReferenceShamirMpc::ShareLocalSumWithProvenance(
     return true;
 }
 
+bool ReferenceShamirMpc::MultiplyVector(
+    const std::vector<F>& lhs_shares,
+    const std::vector<F>& rhs_shares,
+    std::vector<F>* product_shares,
+    Digest* transcript_binding) const {
+    if(!product_shares)return false;
+    product_shares->clear();
+    if(transcript_binding)*transcript_binding={};
+    if(!valid() || !authenticated_transport_available() ||
+       !detectable_degree_reduction_available() ||
+       lhs_shares.empty() || lhs_shares.size()>64 ||
+       lhs_shares.size()!=rhs_shares.size())return false;
+    const size_t width=lhs_shares.size();
+    u64 agreed_width=0;
+    Digest width_binding{};
+    constexpr u64 VECTOR_WIDTH_KIND=0x4d56454357445448ULL; // MVECWDTH
+    constexpr u64 VECTOR_VSS_KIND=0x4d56454356535331ULL; // MVECVSS1
+    constexpr u64 VECTOR_TRANSCRIPT_DOMAIN=0x50564d5645435452ULL;
+    if(!CollectiveSameWord(
+           static_cast<u64>(width),VECTOR_WIDTH_KIND,0,
+           &agreed_width,&width_binding) ||
+       agreed_width!=width || width_binding==Digest{})
+        return false;
+    const int dealer_count=2*threshold_+1;
+    if(dealer_count<=0 || dealer_count>world_size_)return false;
+    std::vector<F> local_products(width);
+    for(size_t i=0;i<width;++i)
+        local_products[i]=lhs_shares[i]*rhs_shares[i];
+    ReferenceBivariateVss vss(rank_,world_size_,threshold_,comm_);
+    if(!vss.valid())return false;
+    std::vector<F> shared;
+    std::vector<ReferenceVssReceipt> receipts;
+    if(!vss.ShareVectorsFromPrefixDealersAuthenticated(
+           dealer_count,local_products,width,&shared,&receipts,
+           *authenticated_exchange_,
+           NextTransportContext(AUTH_MPC_PROTOCOL_DOMAIN,VECTOR_VSS_KIND),
+           nullptr) ||
+       shared.size()!=width*static_cast<size_t>(dealer_count) ||
+       receipts.size()!=static_cast<size_t>(dealer_count))
+        return false;
+    product_shares->assign(width,F(0));
+    std::vector<u64> transcript={
+        VECTOR_TRANSCRIPT_DOMAIN,
+        static_cast<u64>(width),
+        static_cast<u64>(dealer_count),
+        static_cast<u64>(world_size_),
+        static_cast<u64>(threshold_)};
+    append_digest_words(width_binding,&transcript);
+    for(int dealer=0;dealer<dealer_count;++dealer){
+        const auto& receipt=receipts[static_cast<size_t>(dealer)];
+        if(!receipt.available || !receipt.consistent ||
+           receipt.dealer!=dealer ||
+           receipt.element_count!=width ||
+           receipt.transcript_binding==Digest{})return false;
+        const F weight=LagrangeAtZero(dealer,dealer_count);
+        for(size_t lane=0;lane<width;++lane)
+            (*product_shares)[lane]+=
+                weight*shared[static_cast<size_t>(dealer)*width+lane];
+        transcript.push_back(static_cast<u64>(dealer));
+        append_digest_words(receipt.transcript_binding,&transcript);
+    }
+    const Digest binding=hash_words(transcript);
+    if(binding==Digest{})return false;
+    if(transcript_binding)*transcript_binding=binding;
+    return true;
+}
+
 bool ReferenceShamirMpc::Multiply(
     const F& lhs_share, const F& rhs_share, F* product_share,
     Digest* transcript_binding) const {
     return MultiplyInternal(
         lhs_share, rhs_share, nullptr, nullptr,
-        product_share, transcript_binding);
+        product_share, transcript_binding, nullptr, nullptr);
 }
 
 bool ReferenceShamirMpc::MultiplyWithConsistency(
@@ -1050,7 +1531,7 @@ bool ReferenceShamirMpc::MultiplyWithConsistency(
     F* product_share, Digest* transcript_binding) const {
     return MultiplyInternal(
         lhs_share, rhs_share, &context, nullptr,
-        product_share, transcript_binding);
+        product_share, transcript_binding, nullptr, nullptr);
 }
 
 bool ReferenceShamirMpc::MultiplyWithConsistency(
@@ -1060,23 +1541,71 @@ bool ReferenceShamirMpc::MultiplyWithConsistency(
     F* product_share, Digest* transcript_binding) const {
     return MultiplyInternal(
         lhs_share, rhs_share, &context, &local_witness,
-        product_share, transcript_binding);
+        product_share, transcript_binding, nullptr, nullptr);
+}
+
+bool ReferenceShamirMpc::MultiplyWithConsistency(
+    const F& lhs_share, const F& rhs_share,
+    const ReferenceMultiplicationConsistencyContext& context,
+    const ReferenceMultiplicationConsistencyLocalWitness& local_witness,
+    F* product_share, Digest* transcript_binding,
+    std::vector<ReferenceMultiplicationFailureCertificate>*
+        failure_certificates,
+    std::vector<std::vector<u64>>* encoded_failure_certificates) const {
+    return MultiplyInternal(
+        lhs_share, rhs_share, &context, &local_witness,
+        product_share, transcript_binding, failure_certificates,
+        encoded_failure_certificates);
 }
 
 bool ReferenceShamirMpc::MultiplyInternal(
     const F& lhs_share, const F& rhs_share,
     const ReferenceMultiplicationConsistencyContext* context,
     const ReferenceMultiplicationConsistencyLocalWitness* local_witness,
-    F* product_share, Digest* transcript_binding) const {
+    F* product_share, Digest* transcript_binding,
+    std::vector<ReferenceMultiplicationFailureCertificate>*
+        failure_certificates,
+    std::vector<std::vector<u64>>* encoded_failure_certificates) const {
     if (!valid() || !product_share) return false;
-    const u64 local_require_consistency = context ? 1ULL : 0ULL;
-    u64 agreed_require_consistency = 0;
+    if (failure_certificates) failure_certificates->clear();
+    if (encoded_failure_certificates)
+        encoded_failure_certificates->clear();
+    // The RS-syndrome path checks that ALL committed local products lie on
+    // the degree-2t product polynomial. If n>3t, the n-t honest evaluations
+    // uniquely determine that polynomial. The public challenge is sampled
+    // only AFTER each dealer's VSS output is bound, so malicious dealers
+    // cannot adapt their local products to the compressed parity check.
+    const char* rs_mode_env = std::getenv("PVIA_RS_MUL_SYNDROME");
+    const bool local_rs_mode = rs_mode_env &&
+        std::strcmp(rs_mode_env, "1") == 0;
+    const u64 local_multiply_mode =
+        (context ? 1ULL : 0ULL) | (local_rs_mode ? 2ULL : 0ULL);
+    u64 agreed_multiply_mode = 0;
     Digest require_mode_binding{};
-    if (!CollectiveSameWord(local_require_consistency,
-            AUTH_KIND_MULTIPLY_MODE, 0, &agreed_require_consistency,
-            &require_mode_binding))
+    if (!context && !local_rs_mode &&
+        authenticated_transport_available() &&
+        passive_multiply_mode_cached_) {
+        agreed_multiply_mode = 0;
+        require_mode_binding = passive_multiply_mode_binding_;
+    } else {
+        if (!CollectiveSameWord(
+                local_multiply_mode, AUTH_KIND_MULTIPLY_MODE, 0,
+                &agreed_multiply_mode, &require_mode_binding))
+            return false;
+        if (local_multiply_mode == 0 &&
+            authenticated_transport_available() &&
+            require_mode_binding != Digest{}) {
+            passive_multiply_mode_cached_ = true;
+            passive_multiply_mode_binding_ = require_mode_binding;
+        }
+    }
+    if (agreed_multiply_mode != local_multiply_mode)
         return false;
-    const bool require_consistency = agreed_require_consistency != 0;
+    const bool require_consistency = (agreed_multiply_mode & 1ULL) != 0;
+    const bool rs_check = (agreed_multiply_mode & 2ULL) != 0;
+    if (rs_check && (!authenticated_transport_available() ||
+                     !detectable_degree_reduction_available()))
+        return false;
 
     MultiplicationConsistencyCapabilities proof_capabilities;
     Digest request_binding{};
@@ -1133,13 +1662,21 @@ bool ReferenceShamirMpc::MultiplyInternal(
         }
     }
 
-    const F local_product = lhs_share * rhs_share;
+    F local_product = lhs_share * rhs_share;
+    // Deliberately confined to the isolated selftest entry point. This
+    // simulates a faulty dealer who VSS-shares an incorrect local product.
+    if (rs_check && std::getenv("PVIA_REFERENCE_RS_MUL_SELFTEST")) {
+        const char* corrupt = std::getenv("PVIA_TEST_RS_MUL_FAULT_DEALER");
+        if (corrupt && std::strcmp(corrupt, "1") == 0 && rank_ == 1)
+            local_product += F(1);
+    }
     const bool use_vss = detectable_degree_reduction_available();
     if (require_consistency && !use_vss) return false;
     std::vector<u64> transcript_words = {
         MULTIPLY_TRANSCRIPT_DOMAIN,
         use_vss ? 1ULL : 0ULL,
         require_consistency ? 1ULL : 0ULL,
+        rs_check ? 1ULL : 0ULL,
         authenticated_transport_available() ? 1ULL : 0ULL,
         static_cast<u64>(world_size_),
         static_cast<u64>(threshold_)};
@@ -1157,12 +1694,637 @@ bool ReferenceShamirMpc::MultiplyInternal(
     }
 
     F reduced_share(0);
+    ReferenceMultiplicationRsEvent rs_event;
+    bool rs_event_nonzero = false;
     std::vector<MultiplicationConsistencyProofArtifact> proofs;
     if (require_consistency) proofs.reserve(static_cast<size_t>(world_size_));
     if (use_vss) {
         ReferenceBivariateVss vss(rank_, world_size_, threshold_, comm_);
         if (!vss.valid()) return false;
-        for (int dealer = 0; dealer < world_size_; ++dealer) {
+        if (authenticated_transport_available() && !require_consistency) {
+            // The local products are evaluations of a degree-2t polynomial.
+            // The reference-passive fast path therefore needs only 2t+1
+            // evaluation points to reconstruct its value at zero before
+            // resharing.  The strong-consistency path below deliberately
+            // retains all participants because its proof set is per dealer.
+            const int reduction_dealer_count =
+                rs_check ? world_size_ : 2 * threshold_ + 1;
+            if (reduction_dealer_count <= 0 ||
+                reduction_dealer_count > world_size_ ||
+                2 * threshold_ >= world_size_)
+                return false;
+            std::vector<F> batch_shares;
+            std::vector<ReferenceVssReceipt> batch_receipts;
+            const AuthenticatedMpcMessageContext batch_context =
+                NextTransportContext(
+                    AUTH_MPC_PROTOCOL_DOMAIN, AUTH_KIND_MULTIPLY_VSS, 0);
+            if (!vss.ShareScalarsFromPrefixDealersAuthenticated(
+                    reduction_dealer_count, local_product,
+                    &batch_shares, &batch_receipts,
+                    *authenticated_exchange_, batch_context, nullptr) ||
+                batch_shares.size() !=
+                    static_cast<size_t>(reduction_dealer_count) ||
+                batch_receipts.size() !=
+                    static_cast<size_t>(reduction_dealer_count))
+                return false;
+            transcript_words.push_back(
+                static_cast<u64>(reduction_dealer_count));
+            for (int dealer = 0;
+                 dealer < reduction_dealer_count; ++dealer) {
+                const auto& receipt =
+                    batch_receipts[static_cast<size_t>(dealer)];
+                if (!receipt.available || !receipt.consistent ||
+                    receipt.dealer != dealer ||
+                    receipt.transcript_binding == Digest{})
+                    return false;
+                // Only 2t+1 product evaluations are needed to interpolate
+                // the degree-2t product at zero, but RS mode authenticates
+                // ALL n evaluations before taking these first 2t+1.
+                if (dealer < 2 * threshold_ + 1)
+                    reduced_share +=
+                        LagrangeAtZero(dealer, 2 * threshold_ + 1) *
+                        batch_shares[static_cast<size_t>(dealer)];
+                transcript_words.push_back(static_cast<u64>(dealer));
+                append_digest_words(
+                    receipt.transcript_binding, &transcript_words);
+            }
+            if (rs_check) {
+                Digest seed{}, seed_binding{};
+                if (!JointPublicSeed(&seed, &seed_binding) ||
+                    seed == Digest{} || seed_binding == Digest{})
+                    return false;
+                const int checks = world_size_ - 2 * threshold_ - 1;
+                if (checks < 1) return false;
+                F syndrome_share(0);
+                for (int dealer = 0; dealer < world_size_; ++dealer) {
+                    const F xi(dealer + 1);
+                    F denominator(1);
+                    for (int other = 0; other < world_size_; ++other)
+                        if (other != dealer)
+                            denominator *= xi - F(other + 1);
+                    if (denominator == F(0)) return false;
+                    // Dual RS parity-check rows are
+                    // x_i^k / prod_{j!=i}(x_i-x_j), 0<=k<n-2t-1.
+                    // Randomly compress all rows into one hidden sharing;
+                    // only its (normally zero) syndrome is opened.
+                    F compressed_coefficient(1);
+                    F xpower(xi);
+                    for (int k = 1; k < checks; ++k) {
+                        std::vector<u64> coeff_words = {
+                            RS_PRODUCT_PARITY_DOMAIN,
+                            static_cast<u64>(world_size_),
+                            static_cast<u64>(threshold_),
+                            static_cast<u64>(k)};
+                        append_digest_words(seed, &coeff_words);
+                        const Digest coeff_digest = hash_words(coeff_words);
+                        if (coeff_digest == Digest{}) return false;
+                        u64 limbs[2]{};
+                        std::memcpy(&limbs[0], coeff_digest.bytes.data(), 8);
+                        std::memcpy(&limbs[1], coeff_digest.bytes.data()+8, 8);
+                        // Digest limbs are arbitrary 64-bit words, whereas
+                        // fieldElement's constructor expects canonical
+                        // representatives in [0, F::mod). Reduce both
+                        // coordinates before constructing the extension-field
+                        // coefficient; otherwise arithmetic may start from
+                        // non-canonical values and produce false RS syndromes.
+                        const F coeff(
+                            static_cast<long long>(limbs[0] % F::mod),
+                            static_cast<long long>(limbs[1] % F::mod));
+                        compressed_coefficient += coeff * xpower;
+                        xpower *= xi;
+                    }
+                    syndrome_share +=
+                        denominator.inv() * compressed_coefficient *
+                        batch_shares[static_cast<size_t>(dealer)];
+                }
+                F opened_syndrome(0);
+                Digest syndrome_opening_binding{};
+                if (!Open(syndrome_share, &opened_syndrome,
+                          &syndrome_opening_binding) ||
+                    syndrome_opening_binding == Digest{})
+                    return false;
+                if (rank_ == 0 &&
+                    (std::getenv("PVIA_EXPERIMENT_METRICS") ||
+                     std::getenv("PVIA_REFERENCE_RS_MUL_SELFTEST"))) {
+                    std::fprintf(stderr,
+                        "[PVIA][rs-product-syndrome] checks=%d "
+                        "n=%d t=%d result=%s opening=one-syndrome-only\n",
+                        checks, world_size_, threshold_,
+                        opened_syndrome == F(0) ? "PASS" : "REJECT");
+                }
+                if (opened_syndrome != F(0)) return false;
+                transcript_words.push_back(RS_PRODUCT_PARITY_DOMAIN);
+                transcript_words.push_back(static_cast<u64>(checks));
+                append_digest_words(seed_binding, &transcript_words);
+                append_digest_words(seed, &transcript_words);
+                append_digest_words(
+                    syndrome_opening_binding, &transcript_words);
+            }
+        } else if (authenticated_transport_available() && require_consistency) {
+            // Strong path: batch all dealer VSS rows first, then each dealer
+            // generates its own consistency proof concurrently. The old loop
+            // proved/broadcast one dealer at a time, multiplying SP1 proving
+            // latency by N even though all four witnesses are independent.
+            const AuthenticatedMpcMessageContext batch_context =
+                NextTransportContext(
+                    AUTH_MPC_PROTOCOL_DOMAIN, AUTH_KIND_MULTIPLY_VSS,
+                    context->multiplication_id);
+            std::vector<F> batch_shares;
+            std::vector<ReferenceVssReceipt> batch_receipts;
+            std::vector<ReferenceVssDealerWitness> dealer_witnesses;
+            if (!vss.ShareScalarsFromPrefixDealersAuthenticated(
+                    world_size_, local_product, &batch_shares,
+                    &batch_receipts, *authenticated_exchange_,
+                    batch_context, nullptr, &dealer_witnesses) ||
+                batch_shares.size() != static_cast<size_t>(world_size_) ||
+                batch_receipts.size() != static_cast<size_t>(world_size_) ||
+                dealer_witnesses.size() != static_cast<size_t>(world_size_))
+                return false;
+
+            // In the strong path, bind the RS syndrome to the same ordered
+            // dealer VSS receipts and multiplication statement before any
+            // per-dealer proof-preflight status is collected.
+            if (rs_check) {
+                Digest seed{}, seed_binding{};
+                if (!JointPublicSeed(&seed, &seed_binding) ||
+                    seed == Digest{} || seed_binding == Digest{})
+                    return false;
+                const int checks = world_size_ - 2 * threshold_ - 1;
+                if (checks < 1) return false;
+                F syndrome_share(0);
+                for (int dealer = 0; dealer < world_size_; ++dealer) {
+                    const F xi(dealer + 1);
+                    F denominator(1);
+                    for (int other = 0; other < world_size_; ++other)
+                        if (other != dealer)
+                            denominator *= xi - F(other + 1);
+                    if (denominator == F(0)) return false;
+                    F compressed_coefficient(1);
+                    F xpower(xi);
+                    for (int k = 1; k < checks; ++k) {
+                        std::vector<u64> coeff_words = {
+                            RS_PRODUCT_PARITY_DOMAIN,
+                            static_cast<u64>(world_size_),
+                            static_cast<u64>(threshold_),
+                            static_cast<u64>(k)};
+                        append_digest_words(seed, &coeff_words);
+                        const Digest coeff_digest = hash_words(coeff_words);
+                        if (coeff_digest == Digest{}) return false;
+                        u64 limbs[2]{};
+                        std::memcpy(&limbs[0], coeff_digest.bytes.data(), 8);
+                        std::memcpy(&limbs[1], coeff_digest.bytes.data()+8, 8);
+                        // Digest limbs are arbitrary 64-bit words, whereas
+                        // fieldElement's constructor expects canonical
+                        // representatives in [0, F::mod). Reduce both
+                        // coordinates before constructing the extension-field
+                        // coefficient; otherwise arithmetic may start from
+                        // non-canonical values and produce false RS syndromes.
+                        const F coeff(
+                            static_cast<long long>(limbs[0] % F::mod),
+                            static_cast<long long>(limbs[1] % F::mod));
+                        compressed_coefficient += coeff * xpower;
+                        xpower *= xi;
+                    }
+                    syndrome_share +=
+                        denominator.inv() * compressed_coefficient *
+                        batch_shares[static_cast<size_t>(dealer)];
+                }
+                F opened_syndrome(0);
+                Digest opening_binding{};
+                if (!Open(syndrome_share, &opened_syndrome,
+                          &opening_binding) ||
+                    opening_binding == Digest{})
+                    return false;
+                rs_event.sid = context->sid;
+                rs_event.checkpoint = context->checkpoint;
+                rs_event.multiplication_id = context->multiplication_id;
+                rs_event.world_size = static_cast<uint32_t>(world_size_);
+                rs_event.threshold = static_cast<uint32_t>(threshold_);
+                rs_event.lhs_sharing_binding = context->lhs_sharing_binding;
+                rs_event.rhs_sharing_binding = context->rhs_sharing_binding;
+                rs_event.joint_seed = seed;
+                rs_event.joint_seed_binding = seed_binding;
+                rs_event.syndrome = opened_syndrome;
+                rs_event.syndrome_opening_binding = opening_binding;
+                rs_event.output_sharing_bindings.reserve(
+                    static_cast<size_t>(world_size_));
+                for (int dealer = 0; dealer < world_size_; ++dealer) {
+                    const auto& receipt =
+                        batch_receipts[static_cast<size_t>(dealer)];
+                    if (!receipt.available || !receipt.consistent ||
+                        receipt.dealer != dealer ||
+                        receipt.transcript_binding == Digest{})
+                        return false;
+                    rs_event.output_sharing_bindings.push_back(
+                        receipt.transcript_binding);
+                }
+                rs_event.event_binding =
+                    compute_reference_multiplication_rs_event_binding(rs_event);
+                if (!validate_reference_multiplication_rs_event(rs_event))
+                    return false;
+                rs_event_nonzero = opened_syndrome != F(0);
+                transcript_words.push_back(RS_PRODUCT_PARITY_DOMAIN);
+                transcript_words.push_back(static_cast<u64>(checks));
+                append_digest_words(seed_binding, &transcript_words);
+                append_digest_words(seed, &transcript_words);
+                append_digest_words(opening_binding, &transcript_words);
+                append_digest_words(rs_event.event_binding, &transcript_words);
+                if (rank_ == 0 &&
+                    (std::getenv("PVIA_EXPERIMENT_METRICS") ||
+                     std::getenv("PVIA_REFERENCE_RS_MUL_SELFTEST"))) {
+                    std::fprintf(stderr,
+                        "[PVIA][rs-product-syndrome-strong] checks=%d "
+                        "n=%d t=%d result=%s opening=one-syndrome-only\n",
+                        checks, world_size_, threshold_,
+                        rs_event_nonzero ? "REJECT" : "PASS");
+                }
+            }
+
+            std::vector<MultiplicationConsistencyStatement> statements(
+                static_cast<size_t>(world_size_));
+            bool statements_ready = true;
+            for (int dealer = 0; dealer < world_size_; ++dealer) {
+                const auto& receipt =
+                    batch_receipts[static_cast<size_t>(dealer)];
+                if (!receipt.available || !receipt.consistent ||
+                    receipt.dealer != dealer ||
+                    receipt.transcript_binding == Digest{}) {
+                    statements_ready = false;
+                    continue;
+                }
+                reduced_share +=
+                    LagrangeAtZero(dealer, world_size_) *
+                    batch_shares[static_cast<size_t>(dealer)];
+                transcript_words.push_back(static_cast<u64>(dealer));
+                append_digest_words(
+                    receipt.transcript_binding, &transcript_words);
+
+                auto& statement = statements[static_cast<size_t>(dealer)];
+                statement.sid = context->sid;
+                statement.checkpoint = context->checkpoint;
+                statement.multiplication_id = context->multiplication_id;
+                statement.dealer = static_cast<uint32_t>(dealer);
+                statement.lhs_sharing_binding =
+                    context->lhs_sharing_binding;
+                statement.rhs_sharing_binding =
+                    context->rhs_sharing_binding;
+                statement.output_sharing_binding =
+                    receipt.transcript_binding;
+                statement.context_binding = context->context_binding;
+                statement.statement_binding =
+                    compute_multiplication_consistency_statement_binding(
+                        statement);
+                if (!validate_multiplication_consistency_statement(statement))
+                    statements_ready = false;
+            }
+            Digest statement_ready_binding{};
+            if (!CollectiveAllTrue(
+                    statements_ready, AUTH_KIND_PROOF_STATEMENTS,
+                    context->multiplication_id, &statement_ready_binding) ||
+                statement_ready_binding == Digest{})
+                return false;
+            append_digest_words(statement_ready_binding, &transcript_words);
+
+            MultiplicationConsistencyProofArtifact local_proof;
+            std::vector<u64> encoded_local_proof;
+            bool local_prover_ready = false;
+            int local_preflight_reason = 1;
+            int local_proof_failure_reason = 0;
+            MultiplicationConsistencyStatement local_statement{};
+            MultiplicationConsistencyWitness local_witness_artifact;
+            if (rank_ >= 0 && rank_ < world_size_ && local_witness) {
+                const size_t own = static_cast<size_t>(rank_);
+                const auto& dealer_witness = dealer_witnesses[own];
+                const auto& receipt = batch_receipts[own];
+                local_statement = statements[own];
+                if (dealer_witness.available &&
+                    dealer_witness.dealer == rank_ &&
+                    dealer_witness.transcript_binding ==
+                        receipt.transcript_binding &&
+                    !dealer_witness.coefficient_words.empty()) {
+                    local_witness_artifact.lhs_share = lhs_share;
+                    local_witness_artifact.rhs_share = rhs_share;
+                    local_witness_artifact.product_value = local_product;
+                    const bool input_witness_ready =
+                        wrap_reference_multiplication_consistency_input_sharing_witness(
+                            local_witness->lhs_sharing_witness_words,
+                            local_statement.lhs_sharing_binding,
+                            &local_witness_artifact.lhs_sharing_witness_words) &&
+                        wrap_reference_multiplication_consistency_input_sharing_witness(
+                            local_witness->rhs_sharing_witness_words,
+                            local_statement.rhs_sharing_binding,
+                            &local_witness_artifact.rhs_sharing_witness_words);
+                    const std::vector<u64> output_payload =
+                        encode_reference_vss_dealer_witness(dealer_witness);
+                    const bool output_witness_ready =
+                        !output_payload.empty() &&
+                        wrap_reference_multiplication_consistency_sharing_witness(
+                            MultiplicationConsistencySharingWitnessKind::VSS_DEALER,
+                            output_payload,
+                            local_statement.output_sharing_binding,
+                            &local_witness_artifact.output_sharing_witness_words);
+                    if (!input_witness_ready) {
+                        local_preflight_reason = 2;
+                    } else if (!output_witness_ready) {
+                        local_preflight_reason = 3;
+                    } else if (!validate_multiplication_consistency_provider_witness_relation(
+                                   local_statement, local_witness_artifact)) {
+                        local_preflight_reason = 4;
+                    } else {
+                        local_preflight_reason = 0;
+                    }
+                }
+            }
+            if (rs_check && rs_event_nonzero) {
+                const std::vector<u64> local_status =
+                    encode_reference_multiplication_failure_status(
+                        rs_event, static_cast<uint32_t>(rank_),
+                        static_cast<uint64_t>(local_preflight_reason));
+                if (local_status.size() != 17) return false;
+                const AuthenticatedMpcMessageContext status_context =
+                    NextTransportContext(
+                        REFERENCE_MULTIPLICATION_FAILURE_PROTOCOL_DOMAIN,
+                        REFERENCE_MULTIPLICATION_FAILURE_STATUS_KIND,
+                        context->multiplication_id);
+                std::vector<u64> all_status_words;
+                Digest status_transcript_binding{};
+                if (!authenticated_exchange_->AllGatherWords(
+                        status_context, local_status, &all_status_words,
+                        &status_transcript_binding) ||
+                    status_transcript_binding == Digest{} ||
+                    all_status_words.size() !=
+                        static_cast<size_t>(world_size_) * local_status.size())
+                    return false;
+
+                std::vector<std::vector<u64>> status_payloads;
+                status_payloads.reserve(static_cast<size_t>(world_size_));
+                size_t failed_preflight_count = 0;
+                uint32_t accused_dealer = 0;
+                bool status_codes_supported = true;
+                for (int sender = 0; sender < world_size_; ++sender) {
+                    const auto begin = all_status_words.begin() +
+                        static_cast<std::ptrdiff_t>(
+                            static_cast<size_t>(sender) * local_status.size());
+                    std::vector<u64> payload(
+                        begin, begin + static_cast<std::ptrdiff_t>(
+                            local_status.size()));
+                    if (payload[7] != static_cast<u64>(sender) ||
+                        payload[8] > 4)
+                        status_codes_supported = false;
+                    if (payload[8] == static_cast<uint64_t>(
+                            ReferenceMultiplicationFailureCode::
+                                RELATION_PRECHECK_FAILED)) {
+                        ++failed_preflight_count;
+                        accused_dealer = static_cast<uint32_t>(sender);
+                    } else if (payload[8] != 0) {
+                        status_codes_supported = false;
+                    }
+                    status_payloads.push_back(std::move(payload));
+                }
+
+                std::vector<AuthenticatedMpcSignedEnvelopeObservation>
+                    exported_observations;
+                if (!authenticated_exchange_->ExportVerifiedEnvelopeObservations(
+                        context->sid, context->checkpoint,
+                        &exported_observations))
+                    return false;
+                std::vector<AuthenticatedMpcSignedEnvelopeObservation>
+                    status_observations;
+                for (const auto& observation : exported_observations) {
+                    const auto& observed = observation.context;
+                    if (observed.protocol_domain != status_context.protocol_domain ||
+                        observed.sid != status_context.sid ||
+                        observed.checkpoint != status_context.checkpoint ||
+                        observed.round != status_context.round ||
+                        observed.sequence != status_context.sequence ||
+                        observed.message_kind != status_context.message_kind ||
+                        observation.receiver !=
+                            AUTHENTICATED_MPC_BROADCAST_RECEIVER)
+                        continue;
+                    status_observations.push_back(observation);
+                }
+                std::sort(status_observations.begin(),
+                          status_observations.end(),
+                    [](const auto& lhs, const auto& rhs) {
+                        return lhs.sender < rhs.sender;
+                    });
+
+                ReferenceMultiplicationFailureCertificate certificate;
+                std::vector<u64> encoded_certificate;
+                bool public_certificate_ready =
+                    status_codes_supported && failed_preflight_count == 1 &&
+                    status_observations.size() ==
+                        static_cast<size_t>(world_size_);
+                const auto& auth =
+                    Ed25519TransferAuthenticator::instance();
+                if (public_certificate_ready) {
+                    certificate.available = true;
+                    certificate.event = rs_event;
+                    certificate.accused_dealer = accused_dealer;
+                    certificate.failure_code = static_cast<uint64_t>(
+                        ReferenceMultiplicationFailureCode::
+                            RELATION_PRECHECK_FAILED);
+                    certificate.status_context = status_context;
+                    certificate.status_payloads = status_payloads;
+                    certificate.status_observations = status_observations;
+                    certificate.registry_commitment =
+                        auth.RegistryCommitment();
+                    certificate.certificate_binding =
+                        compute_reference_multiplication_failure_certificate_binding(
+                            certificate);
+                    public_certificate_ready =
+                        auth.ready() &&
+                        auth.ExternalRegistryAnchorVerified() &&
+                        auth.ExternalRegistryAnchor() ==
+                            certificate.registry_commitment &&
+                        validate_reference_multiplication_failure_certificate(
+                            certificate) &&
+                        PublicJudge::VerifyMultiplicationFailureCertificate(
+                            certificate, auth.PublicKeys(),
+                            auth.ExternalRegistryAnchor());
+                }
+                if (public_certificate_ready) {
+                    encoded_certificate =
+                        encode_reference_multiplication_failure_certificate(
+                            certificate);
+                    ReferenceMultiplicationFailureCertificate decoded;
+                    public_certificate_ready =
+                        !encoded_certificate.empty() &&
+                        PublicJudge::VerifyMultiplicationFailureCertificate(
+                            encoded_certificate, auth.PublicKeys(),
+                            auth.ExternalRegistryAnchor()) &&
+                        decode_reference_multiplication_failure_certificate(
+                            encoded_certificate, &decoded) &&
+                        decoded.certificate_binding ==
+                            certificate.certificate_binding &&
+                        PublicJudge::VerifyMultiplicationFailureCertificate(
+                            decoded, auth.PublicKeys(),
+                            auth.ExternalRegistryAnchor()) &&
+                        encode_reference_multiplication_failure_certificate(
+                            decoded) == encoded_certificate;
+                }
+
+                // Every participant must independently accept the same
+                // externally anchored certificate before it is surfaced to
+                // the caller. The product remains withheld regardless.
+                Digest certificate_verify_agreement{};
+                if (!CollectiveAllTrue(
+                        public_certificate_ready,
+                        AUTH_KIND_FAILURE_CERT_VERIFY,
+                        context->multiplication_id,
+                        &certificate_verify_agreement) ||
+                    certificate_verify_agreement == Digest{})
+                    return false;
+                const Digest encoded_certificate_binding =
+                    hash_words(encoded_certificate);
+                Digest certificate_binding_agreement{};
+                if (encoded_certificate_binding == Digest{} ||
+                    !CollectiveSameDigest(
+                        encoded_certificate_binding,
+                        AUTH_KIND_FAILURE_CERT_BINDING,
+                        context->multiplication_id,
+                        &certificate_binding_agreement) ||
+                    certificate_binding_agreement == Digest{})
+                    return false;
+                if (failure_certificates)
+                    failure_certificates->push_back(certificate);
+                if (encoded_failure_certificates)
+                    encoded_failure_certificates->push_back(
+                        std::move(encoded_certificate));
+                // A nonzero syndrome always withholds the product. The
+                // optional evidence output now contains only a certificate
+                // accepted by PublicJudge against the external key anchor.
+                return false;
+            }
+
+            Digest preflight_binding{};
+            if (!CollectiveAllTrue(
+                    local_preflight_reason == 0,
+                    AUTH_KIND_PROVER_PREFLIGHT,
+                    context->multiplication_id, &preflight_binding) ||
+                preflight_binding == Digest{}) {
+                std::fprintf(stderr,
+                    "[PVIA][mc-provider] rank=%d witness preflight failed reason=%d\n",
+                    rank_, local_preflight_reason);
+                return false;
+            }
+            local_prover_ready = false;
+            if (local_preflight_reason == 0) {
+                local_proof = multiplication_consistency_backend_->Prove(
+                    local_statement, local_witness_artifact);
+                if (validate_multiplication_consistency_proof_artifact(
+                        local_statement, local_proof)) {
+                    encoded_local_proof =
+                        encode_multiplication_consistency_proof_artifact(
+                            local_proof);
+                    local_prover_ready =
+                        encoded_local_proof.size() >= 17 &&
+                        encoded_local_proof.size() <= (1ULL << 24);
+                    if (!local_prover_ready) local_proof_failure_reason = 6;
+                } else {
+                    local_proof_failure_reason = 5;
+                }
+            }
+            Digest prover_status_binding{};
+            if (!CollectiveAllTrue(
+                    local_prover_ready, AUTH_KIND_PROVER_STATUS,
+                    context->multiplication_id, &prover_status_binding) ||
+                prover_status_binding == Digest{}) {
+                if (!local_prover_ready) {
+                    std::fprintf(stderr,
+                        "[PVIA][mc-provider] rank=%d proof generation/encoding failed reason=%d\n",
+                        rank_, local_proof_failure_reason);
+                }
+                return false;
+            }
+
+
+            // All ranks announce their proof lengths, pad to a common width,
+            // and gather the complete proof set in one authenticated exchange.
+            std::vector<u64> local_proof_size = {
+                static_cast<u64>(encoded_local_proof.size())};
+            std::vector<u64> all_proof_sizes;
+            Digest proof_size_binding{};
+            if (!authenticated_exchange_->AllGatherWords(
+                    NextTransportContext(
+                        AUTH_MPC_PROTOCOL_DOMAIN,
+                        AUTH_KIND_PROOF_BATCH_SIZE,
+                        context->multiplication_id),
+                    local_proof_size, &all_proof_sizes,
+                    &proof_size_binding) ||
+                all_proof_sizes.size() != static_cast<size_t>(world_size_) ||
+                proof_size_binding == Digest{})
+                return false;
+            size_t max_proof_size = 0;
+            for (u64 word_count : all_proof_sizes) {
+                if (word_count < 17 || word_count > (1ULL << 24) ||
+                    word_count > static_cast<u64>(
+                        std::numeric_limits<size_t>::max()))
+                    return false;
+                max_proof_size = std::max(
+                    max_proof_size, static_cast<size_t>(word_count));
+            }
+            if (max_proof_size == 0 ||
+                static_cast<size_t>(world_size_) >
+                    std::numeric_limits<size_t>::max() / max_proof_size)
+                return false;
+            std::vector<u64> padded_local_proof = encoded_local_proof;
+            padded_local_proof.resize(max_proof_size, 0);
+            std::vector<u64> all_encoded_proofs;
+            Digest proof_data_binding{};
+            if (!authenticated_exchange_->AllGatherWords(
+                    NextTransportContext(
+                        AUTH_MPC_PROTOCOL_DOMAIN,
+                        AUTH_KIND_PROOF_BATCH_DATA,
+                        context->multiplication_id),
+                    padded_local_proof, &all_encoded_proofs,
+                    &proof_data_binding) ||
+                all_encoded_proofs.size() !=
+                    static_cast<size_t>(world_size_) * max_proof_size ||
+                proof_data_binding == Digest{})
+                return false;
+
+            bool all_proofs_verified = true;
+            for (int dealer = 0; dealer < world_size_; ++dealer) {
+                const size_t size =
+                    static_cast<size_t>(
+                        all_proof_sizes[static_cast<size_t>(dealer)]);
+                const size_t offset =
+                    static_cast<size_t>(dealer) * max_proof_size;
+                std::vector<u64> encoded(
+                    all_encoded_proofs.begin() +
+                        static_cast<std::ptrdiff_t>(offset),
+                    all_encoded_proofs.begin() +
+                        static_cast<std::ptrdiff_t>(offset + size));
+                MultiplicationConsistencyProofArtifact proof;
+                const bool verified =
+                    decode_multiplication_consistency_proof_artifact(
+                        encoded, &proof) &&
+                    validate_multiplication_consistency_proof_artifact(
+                        statements[static_cast<size_t>(dealer)], proof) &&
+                    multiplication_consistency_backend_->Verify(
+                        statements[static_cast<size_t>(dealer)], proof);
+                if (!verified) {
+                    all_proofs_verified = false;
+                    continue;
+                }
+                append_digest_words(proof.proof_commitment, &transcript_words);
+                proofs.push_back(std::move(proof));
+            }
+            Digest verify_agreement_binding{};
+            if (!CollectiveAllTrue(
+                    all_proofs_verified &&
+                        proofs.size() == static_cast<size_t>(world_size_),
+                    AUTH_KIND_VERIFY_AGREEMENT,
+                    context->multiplication_id, &verify_agreement_binding) ||
+                verify_agreement_binding == Digest{})
+                return false;
+            append_digest_words(prover_status_binding, &transcript_words);
+            append_digest_words(proof_size_binding, &transcript_words);
+            append_digest_words(proof_data_binding, &transcript_words);
+            append_digest_words(verify_agreement_binding, &transcript_words);
+        } else {
+            for (int dealer = 0; dealer < world_size_; ++dealer) {
             std::vector<F> plaintext;
             if (rank_ == dealer) plaintext.push_back(local_product);
             std::vector<F> shares;
@@ -1334,6 +2496,7 @@ bool ReferenceShamirMpc::MultiplyInternal(
                 }
             }
         }
+        }
     } else {
         for (int dealer = 0; dealer < world_size_; ++dealer) {
             F reshared(0);
@@ -1459,6 +2622,133 @@ bool ReferenceShamirMpc::Open(
     return true;
 }
 
+bool ReferenceShamirMpc::OpenMaskedDegree2tProduct(
+    const F& local_product, F* opened,
+    Digest* transcript_binding) const {
+    if (!valid() || !opened || threshold_ < 0)
+        return false;
+    const int degree = 2 * threshold_;
+    const int reconstruction_points = degree + 1;
+    if (degree < 0 || reconstruction_points <= 0 ||
+        reconstruction_points > world_size_)
+        return false;
+
+    std::vector<F> shares(static_cast<size_t>(world_size_), F(0));
+    Digest reveal_binding{};
+    const bool commit_reveal =
+        authenticated_transport_available() ||
+        robust_opening_available();
+
+    if (commit_reveal) {
+        std::vector<u64> local_payload(2);
+        pack_field(local_product, local_payload.data());
+        std::vector<u64> all_payloads;
+        if (!CommitRevealWords(
+                DEGREE2T_OPEN_REVEAL_DOMAIN,
+                local_payload, &all_payloads, &reveal_binding) ||
+            all_payloads.size() !=
+                static_cast<size_t>(world_size_) * 2 ||
+            reveal_binding == Digest{})
+            return false;
+        for (int participant = 0;
+             participant < world_size_; ++participant) {
+            shares[static_cast<size_t>(participant)] =
+                unpack_field(
+                    &all_payloads[
+                        static_cast<size_t>(2 * participant)]);
+        }
+    } else {
+        std::array<u64, 2> local_words{};
+        pack_field(local_product, local_words.data());
+        std::vector<u64> gathered(
+            static_cast<size_t>(world_size_) * 2, 0);
+        MPI_Allgather(
+            local_words.data(), 2, MPI_UINT64_T,
+            gathered.data(), 2, MPI_UINT64_T, comm_);
+        record_control_allgather(
+            2 * sizeof(u64), world_size_);
+        for (int participant = 0;
+             participant < world_size_; ++participant) {
+            shares[static_cast<size_t>(participant)] =
+                unpack_field(
+                    &gathered[
+                        static_cast<size_t>(2 * participant)]);
+        }
+    }
+
+    // Interpolate the degree-2t polynomial from the minimum number of points.
+    F value(0);
+    for (int i = 0; i < reconstruction_points; ++i) {
+        value += LagrangeAtZero(i, reconstruction_points) *
+                 shares[static_cast<size_t>(i)];
+    }
+
+    // In the 3t<n regime, any forged product evaluation is detectable:
+    // the honest parties contribute more than 2t points on the true product
+    // polynomial.  If one of the interpolation points is malformed, at least
+    // one honest extra point disagrees with the resulting degree-2t polynomial.
+    const bool detectable = 3 * threshold_ < world_size_;
+    if (detectable &&
+        reconstruction_points < world_size_) {
+        std::vector<F> denominator_inverse(
+            static_cast<size_t>(reconstruction_points), F(0));
+        for (int basis = 0;
+             basis < reconstruction_points; ++basis) {
+            const F xb(basis + 1);
+            F denominator(1);
+            for (int other = 0;
+                 other < reconstruction_points; ++other) {
+                if (other == basis) continue;
+                denominator *= xb - F(other + 1);
+            }
+            if (denominator == F(0)) return false;
+            denominator_inverse[static_cast<size_t>(basis)] =
+                denominator.inv();
+        }
+        for (int participant = reconstruction_points;
+             participant < world_size_; ++participant) {
+            const F x(participant + 1);
+            F expected(0);
+            for (int basis = 0;
+                 basis < reconstruction_points; ++basis) {
+                F numerator(1);
+                for (int other = 0;
+                     other < reconstruction_points; ++other) {
+                    if (other == basis) continue;
+                    numerator *= x - F(other + 1);
+                }
+                expected +=
+                    shares[static_cast<size_t>(basis)] *
+                    numerator *
+                    denominator_inverse[
+                        static_cast<size_t>(basis)];
+            }
+            if (expected !=
+                shares[static_cast<size_t>(participant)])
+                return false;
+        }
+    }
+
+    *opened = value;
+    if (transcript_binding) {
+        std::vector<u64> words = {
+            DEGREE2T_OPEN_RESULT_DOMAIN,
+            commit_reveal ? 1ULL : 0ULL,
+            detectable ? 1ULL : 0ULL,
+            static_cast<u64>(world_size_),
+            static_cast<u64>(threshold_),
+            static_cast<u64>(degree),
+            static_cast<u64>(reconstruction_points),
+            value.real, value.img};
+        if (commit_reveal)
+            append_digest_words(reveal_binding, &words);
+        *transcript_binding = hash_words(words);
+        if (*transcript_binding == Digest{})
+            return false;
+    }
+    return true;
+}
+
 bool ReferenceShamirMpc::MaskedZeroTest(
     const F& secret_share, bool* is_zero,
     Digest* transcript_binding) const {
@@ -1468,29 +2758,71 @@ bool ReferenceShamirMpc::MaskedZeroTest(
     if (!RandomSharedField(&random_share, &random_sharing_binding) ||
         random_sharing_binding == Digest{})
         return false;
-    F masked_share(0);
-    Digest multiplication_binding{};
-    if (!Multiply(
-            random_share, secret_share, &masked_share,
-            &multiplication_binding) || multiplication_binding == Digest{})
-        return false;
+
+    // Never reveal each local degree-2t product by default. The BGW
+    // path reduces privately then opens one masked result only.
+    const char* allow_legacy =
+        std::getenv("PVIA_ALLOW_LEGACY_DIRECT_ZERO_OPEN");
+    const bool direct_open =
+        allow_legacy && std::strcmp(allow_legacy, "1") == 0 &&
+        std::getenv("PVIA_DISABLE_DIRECT_ZERO_OPEN") == nullptr;
+    const bool rs_enabled = !direct_open &&
+        std::getenv("PVIA_RS_MUL_SYNDROME") &&
+        std::strcmp(std::getenv("PVIA_RS_MUL_SYNDROME"), "1") == 0;
+    if (rank_ == 0 && std::getenv("PVIA_EXPERIMENT_METRICS"))
+        std::fprintf(stderr,
+            "[PVIA][zero-test] mode=%s security=%s\n",
+            direct_open ? "legacy-direct-open" :
+                (rs_enabled ? "rs-syndrome-bgw" : "passive-bgw"),
+            rs_enabled ? "conditional-vss-product-consistency" :
+                         "passive-only");
     F opened(0);
-    Digest opening_binding{};
-    if (!Open(masked_share, &opened, &opening_binding) ||
-        opening_binding == Digest{})
-        return false;
+    Digest product_binding{};
+    if (direct_open) {
+        const F local_product = random_share * secret_share;
+        if (!OpenMaskedDegree2tProduct(
+                local_product, &opened, &product_binding) ||
+            product_binding == Digest{})
+            return false;
+    } else {
+        F masked_share(0);
+        Digest multiplication_binding{};
+        if (!Multiply(
+                random_share, secret_share, &masked_share,
+                &multiplication_binding) ||
+            multiplication_binding == Digest{})
+            return false;
+        Digest opening_binding{};
+        if (!Open(masked_share, &opened, &opening_binding) ||
+            opening_binding == Digest{})
+            return false;
+        product_binding = hash_words({
+            ZERO_TEST_TRANSCRIPT_DOMAIN, 0ULL,
+            static_cast<u64>(world_size_),
+            static_cast<u64>(threshold_)});
+        if (product_binding == Digest{}) return false;
+        std::vector<u64> fallback_words = {
+            ZERO_TEST_TRANSCRIPT_DOMAIN, 0ULL,
+            static_cast<u64>(world_size_),
+            static_cast<u64>(threshold_)};
+        append_digest_words(multiplication_binding, &fallback_words);
+        append_digest_words(opening_binding, &fallback_words);
+        product_binding = hash_words(fallback_words);
+        if (product_binding == Digest{}) return false;
+    }
+
     *is_zero = (opened == F(0));
     if (transcript_binding) {
         std::vector<u64> words = {
             ZERO_TEST_TRANSCRIPT_DOMAIN,
+            direct_open ? 1ULL : 0ULL,
             detectable_degree_reduction_available() ? 1ULL : 0ULL,
             robust_opening_available() ? 1ULL : 0ULL,
             static_cast<u64>(world_size_),
             static_cast<u64>(threshold_),
             *is_zero ? 1ULL : 0ULL};
         append_digest_words(random_sharing_binding, &words);
-        append_digest_words(multiplication_binding, &words);
-        append_digest_words(opening_binding, &words);
+        append_digest_words(product_binding, &words);
         *transcript_binding = hash_words(words);
         if (*transcript_binding == Digest{}) return false;
     }
@@ -1504,38 +2836,46 @@ bool ReferenceShamirMpc::MaskedZeroTestWithConsistency(
     if (!valid() || !is_zero) return false;
     const bool authenticated = authenticated_transport_available();
     std::vector<Digest> consistency_control_bindings;
-    Digest secret_ready_binding{};
+
     const bool local_secret_valid =
         validate_reference_linear_sharing_provenance(secret_provenance);
-    if (!CollectiveAllTrue(
-            local_secret_valid, AUTH_KIND_ZERO_SECRET_READY, 0,
-            &secret_ready_binding))
-        return false;
-    Digest secret_binding_agreement{};
-    if (!CollectiveSameDigest(
-            secret_provenance.binding, AUTH_KIND_ZERO_SECRET_BINDING, 0,
-            &secret_binding_agreement))
-        return false;
-
     const bool local_context_valid =
         context.sid != 0 && context.checkpoint != 0 &&
         context.multiplication_id != 0 &&
         context.context_binding != Digest{};
-    Digest context_ready_binding{};
+
+    // The previous implementation checked secret/context readiness in two
+    // separate collectives. Requiring every rank to satisfy both predicates
+    // is equivalent to one collective over their conjunction.
+    Digest preflight_ready_binding{};
     if (!CollectiveAllTrue(
-            local_context_valid, AUTH_KIND_ZERO_CONTEXT_READY, 0,
-            &context_ready_binding))
+            local_secret_valid && local_context_valid,
+            AUTH_KIND_ZERO_PREFLIGHT_READY, 0,
+            &preflight_ready_binding))
         return false;
+
     std::vector<u64> context_words = {
         STRONG_ZERO_TEST_TRANSCRIPT_DOMAIN,
         context.sid, context.checkpoint, context.multiplication_id};
     append_digest_words(context.context_binding, &context_words);
     const Digest zero_context_binding = hash_words(context_words);
-    Digest context_binding_agreement{};
-    if (zero_context_binding == Digest{} ||
+    if (zero_context_binding == Digest{})
+        return false;
+
+    // Likewise, equality of both bindings on every rank is equivalent
+    // (up to collision resistance of the binding hash) to equality of a
+    // domain-separated digest of the ordered pair.
+    std::vector<u64> preflight_words = {
+        ZERO_PREFLIGHT_PAIR_DOMAIN,
+        context.sid, context.checkpoint, context.multiplication_id};
+    append_digest_words(secret_provenance.binding, &preflight_words);
+    append_digest_words(zero_context_binding, &preflight_words);
+    const Digest preflight_pair_binding = hash_words(preflight_words);
+    Digest preflight_agreement_binding{};
+    if (preflight_pair_binding == Digest{} ||
         !CollectiveSameDigest(
-            zero_context_binding, AUTH_KIND_ZERO_CONTEXT_BINDING,
-            context.multiplication_id, &context_binding_agreement))
+            preflight_pair_binding, AUTH_KIND_ZERO_PREFLIGHT_BINDING,
+            context.multiplication_id, &preflight_agreement_binding))
         return false;
 
     F random_share(0);
@@ -1546,21 +2886,25 @@ bool ReferenceShamirMpc::MaskedZeroTestWithConsistency(
             &random_sharing_binding) ||
         random_sharing_binding == Digest{})
         return false;
-    Digest random_binding_agreement{};
-    if (!CollectiveSameDigest(
-            random_provenance.binding, AUTH_KIND_ZERO_RANDOM_BINDING,
-            context.multiplication_id, &random_binding_agreement))
+
+    std::vector<u64> random_pair_words = {
+        ZERO_RANDOM_PAIR_DOMAIN,
+        context.sid, context.checkpoint, context.multiplication_id};
+    append_digest_words(random_provenance.binding, &random_pair_words);
+    append_digest_words(random_sharing_binding, &random_pair_words);
+    const Digest random_pair_binding = hash_words(random_pair_words);
+    Digest random_pair_agreement_binding{};
+    if (random_pair_binding == Digest{} ||
+        !CollectiveSameDigest(
+            random_pair_binding, AUTH_KIND_ZERO_RANDOM_PAIR,
+            context.multiplication_id, &random_pair_agreement_binding))
         return false;
-    Digest random_transcript_agreement{};
-    if (!CollectiveSameDigest(
-            random_sharing_binding, AUTH_KIND_ZERO_RANDOM_TRANSCRIPT,
-            context.multiplication_id, &random_transcript_agreement))
-        return false;
+
     if (authenticated) {
         consistency_control_bindings = {
-            secret_ready_binding, secret_binding_agreement,
-            context_ready_binding, context_binding_agreement,
-            random_binding_agreement, random_transcript_agreement};
+            preflight_ready_binding,
+            preflight_agreement_binding,
+            random_pair_agreement_binding};
     }
 
     ReferenceMultiplicationConsistencyContext multiplication_context;

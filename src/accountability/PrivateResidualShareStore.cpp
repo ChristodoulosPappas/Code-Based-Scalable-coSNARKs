@@ -1,6 +1,7 @@
 #include "PrivateResidualShareStore.hpp"
 
 #include <cstring>
+#include <algorithm>
 
 namespace pvia {
 namespace {
@@ -26,6 +27,15 @@ bool label_matches_ref(const Label& label, const OperationRef& ref) {
     return label.owner == ref.owner && label.object_id == ref.object_id;
 }
 
+bool is_native_sumcheck_kernel(AuditRelationKernel kernel) {
+    using K = AuditRelationKernel;
+    return kernel == K::COSUMCHECK_ZERO ||
+           kernel == K::COSUMCHECK_QUADRATIC ||
+           kernel == K::COSUMCHECK_BATCH ||
+           kernel == K::DSC_QUADRATIC ||
+           kernel == K::DSC_CUBIC;
+}
+
 } // namespace
 Digest compute_private_residual_computation_binding(
     const PrivateResidualShare& share) {
@@ -45,6 +55,8 @@ Digest compute_private_residual_computation_binding(
     words.push_back(share.source_state_id);
     words.push_back(share.source_state_owner);
     append_digest(share.source_state_digest, &words);
+    if (is_native_sumcheck_kernel(share.kernel))
+        append_digest(share.source_state_layout_binding, &words);
     words.push_back(share.source_state_authentication_scheme_id);
     append_digest(share.source_state_authentication_binding, &words);
     append_digest(share.public_aux_root, &words);
@@ -82,6 +94,10 @@ Digest compute_private_residual_authentication_artifact_binding(
     append_digest(artifact.operation_statement_binding, &words);
     append_digest(artifact.proof_commitment, &words);
     append_digest(artifact.transcript_binding, &words);
+    words.push_back(artifact.issuer_id);
+    words.push_back(artifact.issuer_sequence);
+    append_digest(hash_bytes(
+        artifact.proof_signature.data(),artifact.proof_signature.size()),&words);
     return hash_words(words);
 }
 
@@ -109,6 +125,14 @@ bool validate_private_residual_authentication_artifact(
         artifact.operation_statement_binding !=
             share.operation_statement_binding)
         return false;
+    const bool has_signature=std::any_of(
+        artifact.proof_signature.begin(),artifact.proof_signature.end(),
+        [](uint8_t byte){return byte!=0;});
+    if ((artifact.issuer_id || artifact.issuer_sequence || has_signature) &&
+        (!artifact.issuer_id || !artifact.issuer_sequence || !has_signature ||
+         artifact.proof_commitment!=hash_bytes(
+             artifact.proof_signature.data(),artifact.proof_signature.size())))
+        return false;
     return artifact.binding != Digest{} && artifact.binding ==
         compute_private_residual_authentication_artifact_binding(artifact);
 }
@@ -120,6 +144,8 @@ bool validate_private_residual_share(
         share.kernel == AuditRelationKernel::UNKNOWN ||
         share.checkpoint == 0 || share.source_state_id == 0 ||
         share.source_state_digest == Digest{} ||
+        (is_native_sumcheck_kernel(share.kernel) &&
+         share.source_state_layout_binding == Digest{}) ||
         share.operation_statement_binding == Digest{})
         return false;
     if (share.computation_binding !=
@@ -144,6 +170,10 @@ bool validate_private_residual_share(
             artifact.operation_statement_binding != Digest{} ||
             artifact.proof_commitment != Digest{} ||
             artifact.transcript_binding != Digest{} ||
+            artifact.issuer_id != 0 || artifact.issuer_sequence != 0 ||
+            std::any_of(artifact.proof_signature.begin(),
+                artifact.proof_signature.end(),
+                [](uint8_t byte){return byte!=0;}) ||
             artifact.binding != Digest{})
             return false;
     }

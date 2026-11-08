@@ -1,0 +1,3 @@
+N,public_mean_ms,public_p95_ms,public_stddev_ms,replay_mean_ms,replay_p95_ms,replay_stddev_ms,public_cert_verify_ms,public_cert_aggregate_bytes,replay_cert_aggregate_bytes,repeats,warmup
+64,38.594336,39.370178,0.772515,34.188596,35.709862,1.126443,0.765714,3504,0,10,1
+128,171.938934,220.254187,27.135112,144.803955,163.796961,16.373109,2.387504,5552,0,10,1

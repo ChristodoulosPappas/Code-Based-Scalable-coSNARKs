@@ -43,6 +43,7 @@ bool find_public_transfer_observation_for_dispute(
 class PublicTransferCheckEngine {
 public:
     virtual ~PublicTransferCheckEngine() = default;
+    virtual Digest ProductionCapabilityBinding() const { return {}; }
 
     virtual PublicTransferCheckResult Check(
         const ObligationSet& scope,
@@ -61,6 +62,7 @@ public:
 class PublicTransferCheckBackend {
 public:
     virtual ~PublicTransferCheckBackend() = default;
+    virtual Digest ProductionCapabilityBinding() const { return {}; }
     virtual PublicTransferCheckResult Check(
         const ObligationSet& scope,
         const std::vector<PublicTransferObservation>& local_observations,
@@ -90,6 +92,9 @@ public:
         const PublicTransferObservationStore& observations,
         int rank,
         int world_size) const override;
+    Digest ProductionCapabilityBinding() const override {
+        return backend_.ProductionCapabilityBinding();
+    }
 private:
     const PublicTransferCheckBackend& backend_;
 };

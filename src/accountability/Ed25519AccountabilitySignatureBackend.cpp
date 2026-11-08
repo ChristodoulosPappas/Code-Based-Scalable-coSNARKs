@@ -1,6 +1,8 @@
 #include "Ed25519AccountabilitySignatureBackend.hpp"
 
 #include <openssl/evp.h>
+#include <dlfcn.h>
+#include <cstdlib>
 
 namespace pvia {
 namespace {
@@ -48,6 +50,51 @@ bool make_public_pkey(
         public_key.data(), public_key.size());
     return *pkey != nullptr;
 }
+struct SodiumEd25519VerifyApi {
+    using InitFn = int (*)();
+    using VerifyFn = int (*)(
+        const unsigned char*, const unsigned char*,
+        unsigned long long, const unsigned char*);
+
+    void* handle = nullptr;
+    InitFn init = nullptr;
+    VerifyFn verify = nullptr;
+    bool ready = false;
+
+    SodiumEd25519VerifyApi() {
+        if (std::getenv("PVIA_DISABLE_LIBSODIUM_VERIFY"))
+            return;
+        const char* candidates[] = {
+            "libsodium.so.23", "libsodium.so"};
+        for (const char* name : candidates) {
+            handle = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+            if (handle) break;
+        }
+        if (!handle) return;
+        init = reinterpret_cast<InitFn>(
+            dlsym(handle, "sodium_init"));
+        verify = reinterpret_cast<VerifyFn>(
+            dlsym(handle, "crypto_sign_verify_detached"));
+        if (!init || !verify || init() < 0) {
+            dlclose(handle);
+            handle = nullptr;
+            init = nullptr;
+            verify = nullptr;
+            return;
+        }
+        ready = true;
+    }
+
+    ~SodiumEd25519VerifyApi() {
+        if (handle) dlclose(handle);
+    }
+};
+
+const SodiumEd25519VerifyApi& sodium_verify_api() {
+    static const SodiumEd25519VerifyApi api;
+    return api;
+}
+
 
 } // namespace
 AccountabilitySignatureCapabilities
@@ -125,8 +172,18 @@ bool Ed25519AccountabilitySignatureBackend::Verify(
     const std::vector<uint8_t>& public_key,
     const uint8_t* message, size_t message_size,
     const std::vector<uint8_t>& signature) const {
-    if (!message || message_size == 0 || signature.size() != 64)
+    if (!message || message_size == 0 ||
+        public_key.size() != 32 || signature.size() != 64)
         return false;
+
+    const auto& sodium = sodium_verify_api();
+    if (sodium.ready) {
+        return sodium.verify(
+                   signature.data(), message,
+                   static_cast<unsigned long long>(message_size),
+                   public_key.data()) == 0;
+    }
+
     EVP_PKEY* pkey = nullptr;
     if (!make_public_pkey(public_key, &pkey)) return false;
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();

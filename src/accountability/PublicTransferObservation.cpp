@@ -214,45 +214,85 @@ Digest compute_public_transfer_observation_binding(
 void PublicTransferObservationStore::Put(
     const PublicTransferObservation& observation) {
     if (!validate_public_transfer_observation(observation)) return;
+    const size_t index = observations_.size();
     observations_.push_back(observation);
+    checkpoint_index_[observation.checkpoint].push_back(index);
+    ref_index_[observation.ref].push_back(index);
 }
 
 bool PublicTransferObservationStore::Has(const OperationRef& ref) const {
-    return std::any_of(observations_.begin(), observations_.end(),
-        [&](const PublicTransferObservation& observation) {
-            return same_ref(observation.ref, ref);
-        });
+    const auto it = ref_index_.find(ref);
+    return it != ref_index_.end() && !it->second.empty();
 }
 
 std::vector<PublicTransferObservation>
 PublicTransferObservationStore::Select(const ObligationSet& scope) const {
     std::vector<PublicTransferObservation> out;
-    for (const auto& observation : observations_) {
-        if (!observation.valid) continue;
+
+    // Exact failure/release scopes are checkpoint-bound in normal operation.
+    // Use that index first.  For broader scopes with explicit operation refs,
+    // union the per-ref indices and restore insertion order.
+    const std::vector<size_t>* candidate_indices = nullptr;
+    std::vector<size_t> merged_indices;
+
+    if (scope.checkpoint != 0) {
+        const auto checkpoint_it = checkpoint_index_.find(scope.checkpoint);
+        if (checkpoint_it == checkpoint_index_.end()) return out;
+        candidate_indices = &checkpoint_it->second;
+    } else if (!scope.operations.empty()) {
+        for (const OperationRef& ref : scope.operations) {
+            const auto ref_it = ref_index_.find(ref);
+            if (ref_it == ref_index_.end()) continue;
+            merged_indices.insert(
+                merged_indices.end(),
+                ref_it->second.begin(), ref_it->second.end());
+        }
+        if (merged_indices.empty()) return out;
+        std::sort(merged_indices.begin(), merged_indices.end());
+        merged_indices.erase(
+            std::unique(merged_indices.begin(), merged_indices.end()),
+            merged_indices.end());
+        candidate_indices = &merged_indices;
+    }
+
+    auto consider = [&](const PublicTransferObservation& observation) {
+        if (!observation.valid) return;
         if (scope.session_id != 0 &&
             observation.transfer_label.sid != scope.session_id)
-            continue;
+            return;
         if (scope.phase != Phase::UNKNOWN &&
             observation.transfer_label.phase != scope.phase)
-            continue;
+            return;
         if (scope.exact_round &&
             observation.transfer_label.round != scope.round)
-            continue;
+            return;
         if (scope.checkpoint != 0 &&
             observation.checkpoint != scope.checkpoint)
-            continue;
+            return;
         const Obligation transfer_obligation =
             observation.transfer_label.obligation;
         if (transfer_obligation != Obligation::SEND &&
             transfer_obligation != Obligation::RECEIVE &&
             transfer_obligation != Obligation::CONSUME)
-            continue;
+            return;
         if (!scope.obligations.empty() &&
             std::find(scope.obligations.begin(), scope.obligations.end(),
                       transfer_obligation) == scope.obligations.end())
-            continue;
-        if (!contains_ref(scope.operations, observation.ref)) continue;
+            return;
+        if (!contains_ref(scope.operations, observation.ref)) return;
         out.push_back(observation);
+    };
+
+    if (candidate_indices) {
+        out.reserve(candidate_indices->size());
+        for (size_t index : *candidate_indices) {
+            if (index >= observations_.size()) continue;
+            consider(observations_[index]);
+        }
+    } else {
+        out.reserve(observations_.size());
+        for (const auto& observation : observations_)
+            consider(observation);
     }
     return out;
 }

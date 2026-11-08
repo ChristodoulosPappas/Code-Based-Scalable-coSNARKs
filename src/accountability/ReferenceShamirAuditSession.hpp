@@ -4,6 +4,7 @@
 #include "ReferenceShamirMpc.hpp"
 #include "ReferenceBivariateVss.hpp"
 #include "RegistrationConsistencyProof.hpp"
+#include "RegistrationOriginEndorsements.hpp"
 
 #include <vector>
 
@@ -15,6 +16,7 @@ struct ReferenceShamirSelectedAuditWitness {
     std::vector<F> state_shares;
     std::vector<F> actual_output_shares;
     ReferenceVssLocalWitness registration_vss_witness{};
+    ReferenceVssReceipt registration_vss_receipt{};
 };
 
 struct ReferenceShamirBatchResult {
@@ -58,7 +60,10 @@ public:
             registration_consistency_backend = nullptr,
         const MultiplicationConsistencyProofBackend*
             multiplication_consistency_backend = nullptr,
-        const AuthenticatedMpcExchange* authenticated_exchange = nullptr);
+        const AuthenticatedMpcExchange* authenticated_exchange = nullptr,
+        const RegistrationOriginApprovalBackend*
+            registration_origin_approval_backend = nullptr,
+        bool permit_reference_registration_test_only = false);
 
     bool RegisterFoldOperation(
         uint32_t owner, const OperationRef& ref, const F& public_challenge,
@@ -66,10 +71,20 @@ public:
         const Digest& public_actual_digest,
         const Digest& operation_statement_binding,
         const std::vector<F>& owner_private_state,
-        const std::vector<F>& owner_actual_output);
+        const std::vector<F>& owner_actual_output,
+        const RegistrationNativeContext& native_context = {});
     // All ranks must agree on the public operation descriptors before the
     // random audit challenge is sampled.
     bool SealRegistration();
+
+    // Public-only access to the exact VSS/native binding used by this
+    // checkpoint's proof; never exposes the owner's dealer witness.
+    bool ReadRegisteredPublicConsistencyStatement(
+        const OperationRef& ref,
+        RegistrationConsistencyStatement* out) const;
+    // Fail closed after an out-of-band public-proof rejection. A checkpoint
+    // aborted here cannot later be partially sealed or batch-checked.
+    void AbortRegistrationBeforeSeal();
 
     ReferenceShamirBatchResult BatchCheck() const;
     // Checks a deterministic subset using only residual shares sealed during
@@ -83,6 +98,13 @@ public:
 
     bool sealed() const { return sealed_; }
     size_t operation_count() const { return operations_.size(); }
+    // Confirm that a native statement is represented by this sealed batch's
+    // exact operation descriptor, not merely by a matching checkpoint ID.
+    bool ContainsOperationBinding(
+        const OperationRef& ref,
+        const Digest& operation_statement_binding,
+        const Digest& public_state_digest,
+        const Digest& public_actual_digest) const;
     Digest registration_binding() const { return registration_binding_; }
     Digest registration_consistency_binding() const {
         return registration_consistency_binding_;
@@ -112,6 +134,8 @@ private:
         Digest operation_statement_binding{};
         Digest vss_transcript_binding{};
         ReferenceVssLocalWitness vss_local_witness{};
+        ReferenceVssReceipt vss_receipt{};
+        RegistrationConsistencyStatement registration_consistency_statement{};
         RegistrationConsistencyProofArtifact registration_consistency_proof{};
         std::vector<F> state_shares;
         std::vector<F> actual_output_shares;
@@ -146,16 +170,25 @@ private:
     ReferenceShamirMpc mpc_;
     ReferenceBivariateVss vss_;
     const RegistrationConsistencyProofBackend* registration_consistency_backend_ = nullptr;
+    const RegistrationOriginApprovalBackend*
+        registration_origin_approval_backend_ = nullptr;
     const MultiplicationConsistencyProofBackend* multiplication_consistency_backend_ = nullptr;
     const AuthenticatedMpcExchange* authenticated_exchange_ = nullptr;
     mutable uint64_t transport_sequence_ = 1;
     mutable Digest authenticated_transport_transcript_binding_{};
     std::vector<FoldOperationShares> operations_;
+    // A failed register poisons the entire checkpoint transaction. Earlier
+    // successfully registered operations cannot be selectively sealed.
+    bool registration_failed_ = false;
+    const bool permit_reference_registration_test_only_;
     bool sealed_ = false;
     Digest registration_binding_{};
     Digest registration_consistency_binding_{};
 };
 
+// Isolated registration pre-prove MPI regression: real ephemeral Ed25519
+// endorsements and a synthetic registration consistency proof backend.
+bool run_registration_origin_preprove_gate_selftest(int rank, int world_size);
 bool run_reference_shamir_mpc_selftest(int rank, int world_size);
 
 } // namespace pvia

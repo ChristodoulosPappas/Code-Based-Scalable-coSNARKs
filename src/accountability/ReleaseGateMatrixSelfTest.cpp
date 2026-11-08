@@ -209,6 +209,98 @@ bool run_release_gate_matrix_selftest(
 
     runtime.set_audit_backend(nullptr);
 
+    bool strict_provenance_ok = true;
+    if (runtime.private_residual_provenance_required()) {
+        runtime.begin_private_residual_provenance_gate(700);
+        const bool missing_receipt_denied = !runtime.pre_release_gate(
+            "strict_residual_provenance_missing", Phase::FOLD, 700);
+        Digest statement_binding{};
+        Digest computation_binding{};
+        Digest check_transcript_binding{};
+        statement_binding.bytes[0] = 0xA1;
+        computation_binding.bytes[0] = 0xB2;
+        check_transcript_binding.bytes[0] = 0xC3;
+        const bool authorization_without_source_denied =
+            !runtime.authorize_private_residual_provenance(
+                statement_binding, computation_binding,
+                check_transcript_binding, 7, 11);
+        const bool source_bound =
+            runtime.bind_private_residual_provenance_source(
+                statement_binding, computation_binding);
+        const bool duplicate_source_binding_denied =
+            !runtime.bind_private_residual_provenance_source(
+                statement_binding, computation_binding);
+        const bool missing_transcript_denied =
+            !runtime.authorize_private_residual_provenance(
+                statement_binding, computation_binding, Digest{}, 7, 11);
+        Digest changed_computation_binding = computation_binding;
+        changed_computation_binding.bytes[0] ^= 0x01;
+        const bool mismatched_binding_denied =
+            !runtime.authorize_private_residual_provenance(
+                statement_binding, changed_computation_binding,
+                check_transcript_binding, 7, 11);
+        const bool authorized = runtime.authorize_private_residual_provenance(
+            statement_binding, computation_binding,
+            check_transcript_binding, 7, 11);
+        const bool wrong_round_denied =
+            !runtime.pre_release_gate(
+                "folded_codeword_commitment_preparation",
+                Phase::FOLD, 701);
+        const bool preparation_release_denied =
+            !runtime.pre_release_gate(
+                "folded_codeword_commitment_preparation",
+                Phase::FOLD, 700);
+        const bool authenticated_release_allowed =
+            authorized && runtime.pre_release_gate(
+                "folded_codeword_merkle_commitment",
+                Phase::FOLD, 700);
+        const bool duplicate_release_denied =
+            !runtime.pre_release_gate(
+                "folded_codeword_merkle_commitment",
+                Phase::FOLD, 700);
+        const bool unrelated_release_denied =
+            !runtime.pre_release_gate(
+                "unrelated_release_after_fold",
+                Phase::FOLD, 700);
+        const bool subsequent_phase_release_allowed =
+            runtime.pre_release_gate(
+                "pcs_open_round_release", Phase::PCS, 0);
+        // A new FOLD starts a fresh authorization epoch; the previous
+        // receipt must not authorize the next operation.
+        runtime.begin_private_residual_provenance_gate(702);
+        const bool next_fold_missing_receipt_denied =
+            !runtime.pre_release_gate(
+                "strict_residual_provenance_next_fold_missing",
+                Phase::FOLD, 702);
+        strict_provenance_ok = missing_receipt_denied &&
+            authorization_without_source_denied && source_bound &&
+            duplicate_source_binding_denied && missing_transcript_denied &&
+            mismatched_binding_denied &&
+            authorized && wrong_round_denied && preparation_release_denied &&
+            authenticated_release_allowed && duplicate_release_denied &&
+            unrelated_release_denied && subsequent_phase_release_allowed &&
+            next_fold_missing_receipt_denied;
+        local_ok = local_ok && strict_provenance_ok;
+        if (rank == 0) {
+            std::cout << "[PVIA][strict-residual-provenance-gate-selftest]"
+                      << " missing-receipt=WITHHOLD"
+                      << " no-source-binding=WITHHOLD"
+                      << " duplicate-source-binding=WITHHOLD"
+                      << " missing-transcript=WITHHOLD"
+                      << " mismatched-binding=WITHHOLD"
+                      << " wrong-round=WITHHOLD"
+                      << " preparation-release=WITHHOLD"
+                      << " authenticated=ALLOW"
+                      << " duplicate-release=WITHHOLD"
+                      << " unrelated-release=WITHHOLD"
+                      << " next-phase-release=ALLOW"
+                      << " next-fold-without-receipt=WITHHOLD"
+                      << " result="
+                      << (strict_provenance_ok ? "PASS" : "FAIL")
+                      << "\n";
+        }
+    }
+
     int local = local_ok ? 1 : 0;
     int global = 0;
     MPI_Allreduce(
@@ -219,6 +311,10 @@ bool run_release_gate_matrix_selftest(
             << " cases=" << tests.size()
             << " private-localization=folding-only"
             << " other-families=release-blocking-only"
+            << " strict-provenance="
+            << (runtime.private_residual_provenance_required()
+                    ? (strict_provenance_ok ? "PASS" : "FAIL")
+                    : "not-requested")
             << " result=" << (global ? "PASS" : "FAIL")
             << "\n";
     }

@@ -2,7 +2,9 @@
 
 #include "RelationAwareSecureAuditProvider.hpp"
 #include "RobustAuditSession.hpp"
+#include "Sp1SumcheckProofProvider.hpp"
 
+#include <array>
 #include <vector>
 
 namespace pvia {
@@ -23,6 +25,7 @@ struct SecureAuditComponents {
     const PublicBlameProofEngine* private_blame_proof_engine = nullptr;
     const PublicTransferBlameProofEngine* transfer_blame_proof_engine = nullptr;
     std::vector<const KernelResidualEvaluator*> kernel_evaluators;
+    const Sp1SumcheckProofProvider* native_sumcheck_proof_provider = nullptr;
     RobustAuditSessionBackend* robust_private_session = nullptr;
 };
 
@@ -40,8 +43,23 @@ public:
 
     bool Ready(const SecureAuditRequirements& requirements) const;
     const SecureAuditComponents& components() const { return components_; }
+    bool ReadRelationProofReceipt(
+        AuditRelationKernel kernel,
+        AuditRelationProofReceipt* receipt) const override;
+    const std::array<size_t, 5>& native_sumcheck_finalized_counts() const {
+        return native_sumcheck_finalized_counts_;
+    }
+    size_t native_sumcheck_invalid_count() const {
+        return native_sumcheck_invalid_count_;
+    }
+    size_t native_sumcheck_unavailable_count() const {
+        return native_sumcheck_unavailable_count_;
+    }
 
 protected:
+    void OnResidualFinalized(
+        const AuditOperationView& operation,
+        const PrivateResidualHandle& handle) override;
     void FinalizeInvalidMaterial(
         const AuditOperationView& operation) override;
     void FinalizeUnavailableResidual(
@@ -79,7 +97,14 @@ private:
 
     SecureAuditComponents components_;
     size_t installed_kernel_evaluators_ = 0;
+    std::array<size_t, 5> native_sumcheck_finalized_counts_{};
+    size_t native_sumcheck_invalid_count_ = 0;
+    size_t native_sumcheck_unavailable_count_ = 0;
 };
+
+// Regression guard: fail-closed placeholders must not satisfy production
+// readiness merely because their interface pointers are installed.
+bool run_secure_audit_composition_readiness_selftest();
 
 class SecureAuditRuntimeBundle {
 public:

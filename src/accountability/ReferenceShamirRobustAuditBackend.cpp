@@ -29,7 +29,7 @@ constexpr u64 REF_AUTH_KIND_SID_TRANSITION = 0x5246534944545231ULL; // RFSIDTR1
 constexpr u64 REF_ABORT_RECON_PROTOCOL_DOMAIN = 0x5246414254524543ULL; // RFABTREC
 constexpr u64 REF_ABORT_RECON_ACT_KIND = 0x5246414254414354ULL; // RFABTACT
 constexpr u64 REF_ABORT_RECON_EXEC_KIND = 0x5246414254455845ULL; // RFABTEXE
-constexpr int DESC_WORDS = 21;
+constexpr int DESC_WORDS = 35;
 
 struct FoldDescriptor {
     u64 sid = 0;
@@ -44,7 +44,9 @@ struct FoldDescriptor {
     Digest state_digest{};
     Digest actual_digest{};
     Digest statement_binding{};
+    RegistrationNativeContext native_context{};
 };
+
 void append_digest(const Digest& d, std::vector<u64>* words) {
     for (size_t i = 0; i < 4; ++i) {
         u64 w = 0;
@@ -438,7 +440,11 @@ RobustAuditActivation ReferenceShamirRobustAuditBackend::Activate(
             challenge->size() != 1 ||
             !validate_kernel_residual_material(context) ||
             material->operation.actual == Digest{} ||
-            material->operation.relation_statement == Digest{}) {
+            material->operation.relation_statement == Digest{} ||
+            (registration_consistency_backend_ &&
+                (!states.VerifyAuthentication(state_id) ||
+                 material->operation.predecessor_root == Digest{} ||
+                 checkpoint.root == Digest{}))) {
             ++local_invalid;
             continue;
         }
@@ -455,6 +461,18 @@ RobustAuditActivation ReferenceShamirRobustAuditBackend::Activate(
         d.state_digest = state->state.digest;
         d.actual_digest = material->operation.actual;
         d.statement_binding = material->operation.relation_statement;
+        if (registration_consistency_backend_) {
+            // These metadata bytes are collected from the native execution
+            // record; they are statement bindings, NOT a proof of equality.
+            d.native_context.native_state_id = state_id;
+            d.native_context.authentication_scheme_id =
+                state->authentication_scheme_id;
+            d.native_context.authentication_binding =
+                state->authentication_binding;
+            d.native_context.predecessor_root =
+                material->operation.predecessor_root;
+            d.native_context.checkpoint_root = checkpoint.root;
+        }
         local.push_back(d);
     }
     if (capabilities_.authenticated_channels) {
@@ -478,6 +496,11 @@ RobustAuditActivation ReferenceShamirRobustAuditBackend::Activate(
         append_digest(d.state_digest, &local_words);
         append_digest(d.actual_digest, &local_words);
         append_digest(d.statement_binding, &local_words);
+        local_words.push_back(d.native_context.native_state_id);
+        local_words.push_back(d.native_context.authentication_scheme_id);
+        append_digest(d.native_context.authentication_binding, &local_words);
+        append_digest(d.native_context.predecessor_root, &local_words);
+        append_digest(d.native_context.checkpoint_root, &local_words);
     }
     if (local_words.size() >
         static_cast<size_t>(std::numeric_limits<int>::max()))
@@ -565,6 +588,11 @@ RobustAuditActivation ReferenceShamirRobustAuditBackend::Activate(
         d.state_digest = read_digest(words, off + 9);
         d.actual_digest = read_digest(words, off + 13);
         d.statement_binding = read_digest(words, off + 17);
+        d.native_context.native_state_id = words[off + 21];
+        d.native_context.authentication_scheme_id = words[off + 22];
+        d.native_context.authentication_binding = read_digest(words, off + 23);
+        d.native_context.predecessor_root = read_digest(words, off + 27);
+        d.native_context.checkpoint_root = read_digest(words, off + 31);
         descriptors.push_back(d);
     }
     std::sort(descriptors.begin(), descriptors.end(),
@@ -580,7 +608,10 @@ RobustAuditActivation ReferenceShamirRobustAuditBackend::Activate(
             d.owner >= static_cast<u64>(world_size_) ||
             d.state_size == 0 || d.output_size == 0 ||
             d.state_digest == Digest{} || d.actual_digest == Digest{} ||
-            d.statement_binding == Digest{})
+            d.statement_binding == Digest{} ||
+            (registration_consistency_backend_ &&
+                (!validate_registration_native_context(d.native_context) ||
+                 d.native_context.checkpoint_root != checkpoint.root)))
             return unavailable;
         if (i > 0 && descriptors[i - 1].owner == d.owner &&
             descriptors[i - 1].object_id == d.object_id)
@@ -633,7 +664,16 @@ RobustAuditActivation ReferenceShamirRobustAuditBackend::Activate(
                 material->field_output.size() != d.output_size ||
                 state->state.digest != d.state_digest ||
                 material->operation.actual != d.actual_digest ||
-                material->operation.relation_statement != d.statement_binding) {
+                material->operation.relation_statement != d.statement_binding ||
+                (registration_consistency_backend_ &&
+                    (!states.VerifyAuthentication(d.state_id) ||
+                     state->authentication_scheme_id !=
+                         d.native_context.authentication_scheme_id ||
+                     state->authentication_binding !=
+                         d.native_context.authentication_binding ||
+                     material->operation.predecessor_root !=
+                         d.native_context.predecessor_root ||
+                     state->state.id != d.native_context.native_state_id))) {
                 local_ready = 0;
             } else {
                 KernelResidualContext context{
@@ -665,7 +705,7 @@ RobustAuditActivation ReferenceShamirRobustAuditBackend::Activate(
         if (!entry.session->RegisterFoldOperation(
                 static_cast<uint32_t>(d.owner), ref, challenge,
                 d.state_digest, d.actual_digest, d.statement_binding,
-                owner_state, owner_output))
+                owner_state, owner_output, d.native_context))
             return unavailable;
         entry.operations.push_back(ref);
     }

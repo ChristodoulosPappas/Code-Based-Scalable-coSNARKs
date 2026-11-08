@@ -8,6 +8,7 @@ namespace pvia {
 class PublicTransferBlameProofEngine {
 public:
     virtual ~PublicTransferBlameProofEngine() = default;
+    virtual Digest ProductionCapabilityBinding() const { return {}; }
     virtual PublicBlameProofArtifact Prove(
         const PublicBlameStatement& statement,
         const PublicTransferEvidence& evidence) const = 0;
@@ -19,6 +20,7 @@ public:
 class PublicTransferBlameProofBackend {
 public:
     virtual ~PublicTransferBlameProofBackend() = default;
+    virtual Digest ProductionCapabilityBinding() const { return {}; }
     virtual ExternalPublicBlameProof Prove(
         const std::vector<u64>& public_inputs,
         const std::vector<u64>& transfer_evidence) const = 0;
@@ -39,6 +41,9 @@ public:
     bool Verify(
         const PublicBlameStatement& statement,
         const PublicBlameProofArtifact& proof) const override;
+    Digest ProductionCapabilityBinding() const override {
+        return backend_.ProductionCapabilityBinding();
+    }
 private:
     const PublicTransferBlameProofBackend& backend_;
 };

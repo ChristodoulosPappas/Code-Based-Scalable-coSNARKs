@@ -14,6 +14,7 @@
 #include "accountability/PublicDirectValidation.hpp"
 #include "accountability/AccountableAggregation.hpp"
 #include <cstdlib>
+#include <cstring>
 int com_rounds = 0;
 // R1CS matrixes
 vector<vector<pair<int, int>>> A,B,C;
@@ -259,14 +260,13 @@ vector<pair<F,vector<F>>> prove_phase1( vector<F> vL,
         if (predecessor.object_id != 0)
             predecessors.push_back(predecessor);
 
-        vector<F> source_material = rL;
-        source_material.insert(
-            source_material.end(), rR.begin(), rR.end());
-        source_material.insert(
-            source_material.end(), rO.begin(), rO.end());
-        const pvia::StateId source_state = rt.import_state(
+        const pvia::StateId source_state = rt.import_state_slices(
             "phase1_initial_relation_claim_input",
-            pvia::Phase::INIT, source_material);
+            pvia::Phase::INIT,
+            std::vector<pvia::FieldStateSegment>{
+                {&rL, 0, rL.size()},
+                {&rR, 0, rR.size()},
+                {&rO, 0, rO.size()}});
 
         const pvia::RecordId derive_record = rt.register_vector_operation(
             pvia::Phase::INIT, 2, pvia::Obligation::DERIVE,
@@ -466,19 +466,13 @@ static bool pvia_same_field_vector(const vector<F>& lhs, const vector<F>& rhs) {
     return true;
 }
 
-static void pvia_append_public_matrix_context(
-    const vector<vector<pair<int,int>>>& matrix,
-    uint64_t lane,
+static void pvia_append_digest_words(
+    const pvia::Digest& digest,
     vector<u64>& words) {
-    words.push_back(lane);
-    words.push_back(static_cast<u64>(matrix.size()));
-    for (size_t i = 0; i < matrix.size(); ++i) {
-        words.push_back(static_cast<u64>(i));
-        words.push_back(static_cast<u64>(matrix[i].size()));
-        for (const auto& entry : matrix[i]) {
-            words.push_back(static_cast<u64>(entry.first));
-            words.push_back(static_cast<u64>(entry.second));
-        }
+    for (size_t i = 0; i < 4; ++i) {
+        u64 word = 0;
+        std::memcpy(&word, digest.bytes.data() + 8 * i, 8);
+        words.push_back(word);
     }
 }
 
@@ -499,7 +493,8 @@ static bool pvia_validate_public_vector(
 
 static bool pvia_check_public_r1cs_reduction(
     size_t size, const vector<F>& r,
-    const vector<F>& RA, const vector<F>& RB, const vector<F>& RC, int N) {
+    const vector<F>& RA, const vector<F>& RB, const vector<F>& RC, int N,
+    const pvia::Digest& relation_binding) {
     (void)size;
     vector<F> r1, r2, beta1, beta2;
     const int split = static_cast<int>(r.size()) - static_cast<int>(log2(N));
@@ -556,13 +551,16 @@ static bool pvia_check_public_r1cs_reduction(
     actual.insert(actual.end(), RB.begin(), RB.end());
     actual.insert(actual.end(), RC.begin(), RC.end());
 
+    if (relation_binding == pvia::Digest{})
+        return pvia_public_all_true(false);
     vector<u64> context_words = {
         static_cast<u64>(size), static_cast<u64>(N),
         static_cast<u64>(logm), static_cast<u64>(logn),
         static_cast<u64>(local_columns), static_cast<u64>(local_rows)};
-    pvia_append_public_matrix_context(pA, 0, context_words);
-    pvia_append_public_matrix_context(pB, 1, context_words);
-    pvia_append_public_matrix_context(pC, 2, context_words);
+    // Initial validity already constructed a collective commitment to the
+    // complete public R1CS relation.  Reuse that binding instead of
+    // serializing and hashing pA/pB/pC again on the success path.
+    pvia_append_digest_words(relation_binding, context_words);
     return pvia_validate_public_vector(
         pvia::PublicDirectValidationKind::R1CS_REDUCTION,
         expected, actual, r, context_words);
@@ -626,7 +624,8 @@ vector<pair<F,vector<F>>> prove_phase2(
                   vector<F> r,
                   F yL,F yR, F yO,
                   int N, int size,
-                  int _k, int k, F &a, F &b, F &c,  double &ps){
+                  int _k, int k, F &a, F &b, F &c,
+                  const pvia::Digest& relation_binding, double &ps){
 
     
     RA.clear();RB.clear();RC.clear();
@@ -636,7 +635,8 @@ vector<pair<F,vector<F>>> prove_phase2(
     pt_cp.start();
     _reduce_R1CS_matrixes(size, _r, RA, RB, RC, N);
     if (pvia::Runtime::instance().enabled() &&
-        !pvia_check_public_r1cs_reduction(size, _r, RA, RB, RC, N))
+        !pvia_check_public_r1cs_reduction(
+            size, _r, RA, RB, RC, N, relation_binding))
         pvia_fail_public_prescription("copiop_public_r1cs_reduction");
 
     a = hash_to_field({0});
@@ -911,7 +911,10 @@ void sparse_matrix_evaluation(F y, F a, F b, F c, vector<F> r1,vector<F> r2, vec
     sparse_eval_timer.reset();
     sparse_eval_timer.start();
     int gkr_rounds = com_rounds;
-    pair<F,vector<F>> claim = _prove_sparse_eval_opt(y, a, b, c, beta1, beta2, index,r1,r2, N);
+    // The optimized evaluator contains the native DSC_QUADRATIC probe.
+    // Keep this probe independent from the legacy evaluator selection.
+    pair<F,vector<F>> claim =
+        _prove_sparse_eval_opt(y, a, b, c, beta1, beta2, index, r1, r2, N);
     sparse_eval_timer.end();
     
     if(rank == 0) printf("      Phase 5.1 (Sumcheck): %lf, Rounds: %d\n",sparse_eval_timer.get_time(),com_rounds-gkr_rounds);
@@ -955,7 +958,10 @@ pair<F,vector<F>> sparse_matrix_evaluation_batch(F y, F a, F b, F c, vector<F> r
     temp = pt_cp.get_time();
     sparse_eval_timer.start();
     int gkr_rounds = com_rounds;
-    pair<F,vector<F>> claim = _prove_sparse_eval_opt(y, a, b, c, beta1, beta2, index,r1,r2, N);
+    // The optimized evaluator contains the native DSC_QUADRATIC probe.
+    // Keep this probe independent from the legacy evaluator selection.
+    pair<F,vector<F>> claim =
+        _prove_sparse_eval_opt(y, a, b, c, beta1, beta2, index, r1, r2, N);
     sparse_eval_timer.end();
     
     if(rank == 0) printf("      Phase 5.1 (Sumcheck): %lf, Local time: %lf, Rounds: %d\n",sparse_eval_timer.get_time(),pt_cp.get_time()-temp,com_rounds-gkr_rounds);
@@ -1224,8 +1230,10 @@ void coPIOP_prove(size_t size, int N, int _k, int k, int cir_type){
             std::exit(15);
         }
     }
-    setup_randomness(R, N, _k, k,500 + 2*(logm + logn - 2*logk + 4) + 12+1, 0x5056505245523031ULL);
-    setup_randomness(_R, N, _k, k,500 + 2*(logm + logn - 2*logk + 4) + 12+1, 0x5056505245523032ULL);
+    setup_randomness_pair(
+        R, _R, N, _k, k,
+        500 + 2*(logm + logn - 2*logk + 4) + 12+1,
+        0x5056505245523031ULL, 0x5056505245523032ULL);
     if (pvia::Runtime::instance().enabled()) {
         pvia::Runtime::instance().import_state("R", pvia::Phase::INIT, R);
         pvia::Runtime::instance().import_state("R_mask", pvia::Phase::INIT, _R);
@@ -1285,7 +1293,8 @@ void coPIOP_prove(size_t size, int N, int _k, int k, int cir_type){
     F a,b,c;
     if(rank == 0)printf("1 >>>>>>>> %lf\n",cm/1024.0);
     temp_pc.start();
-    vector<pair<F,vector<F>>> claims2 = prove_phase2(witness, r_witness, rL, rR, rO, RA, RB, RC,R1,R2, claims1[0].second, claims1[0].first,claims1[1].first,claims1[2].first,N, size, _k, k, a,b,c, ps);
+    vector<pair<F,vector<F>>> claims2 = prove_phase2(witness, r_witness, rL, rR, rO, RA, RB, RC,R1,R2, claims1[0].second, claims1[0].first,claims1[1].first,claims1[2].first,N, size, _k, k, a,b,c,
+        initial_validity.relation_definition_binding, ps);
     temp_pc.end();
     if(rank == 0)printf("Phase 3: %lf, rounds: %d\n",temp_pc.get_time(),com_rounds);temp_pc.reset();
     
@@ -1395,8 +1404,10 @@ void coPIOP_prove_batch(size_t size, int N, int _k, int k, int cir_type){
             std::exit(15);
         }
     }
-    setup_randomness(R, N, _k, k,500 + 2*(logm + logn - 2*logk + 4) + 12+1, 0x5056505245523031ULL);
-    setup_randomness(_R, N, _k, k,500 + 2*(logm + logn - 2*logk + 4) + 12+1, 0x5056505245523032ULL);
+    setup_randomness_pair(
+        R, _R, N, _k, k,
+        500 + 2*(logm + logn - 2*logk + 4) + 12+1,
+        0x5056505245523031ULL, 0x5056505245523032ULL);
     if (pvia::Runtime::instance().enabled()) {
         pvia::Runtime::instance().import_state("R", pvia::Phase::INIT, R);
         pvia::Runtime::instance().import_state("R_mask", pvia::Phase::INIT, _R);
@@ -1460,7 +1471,8 @@ void coPIOP_prove_batch(size_t size, int N, int _k, int k, int cir_type){
     temp_rounds = com_rounds;
     temp_pc.start();
     temp_comp_time = pt_cp.get_time();
-    vector<pair<F,vector<F>>> claims2 = prove_phase2(witness, r_witness, rL, rR, rO, RA, RB, RC,R1,R2, claims1[0].second, claims1[0].first,claims1[1].first,claims1[2].first,N, size, _k, k, a,b,c, ps);
+    vector<pair<F,vector<F>>> claims2 = prove_phase2(witness, r_witness, rL, rR, rO, RA, RB, RC,R1,R2, claims1[0].second, claims1[0].first,claims1[1].first,claims1[2].first,N, size, _k, k, a,b,c,
+        initial_validity.relation_definition_binding, ps);
     temp_pc.end();
     if(rank == 0)printf("Phase 3: %lf, rounds: %d, comp_time: %lf\n",temp_pc.get_time(),com_rounds-temp_rounds,pt_cp.get_time()-temp_comp_time);temp_pc.reset();
     

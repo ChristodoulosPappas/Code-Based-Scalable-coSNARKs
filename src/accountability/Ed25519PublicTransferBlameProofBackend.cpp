@@ -21,6 +21,34 @@ struct ProofEnvelope {
     std::vector<u64> evidence_words;
 };
 
+Digest ed25519_transfer_blame_engine_binding(u64 domain) {
+    auto& auth = Ed25519TransferAuthenticator::instance();
+    const auto signature_capabilities = auth.SignatureCapabilities();
+    const Digest registry = auth.RegistryCommitment();
+    const Digest anchor = auth.ExternalRegistryAnchor();
+    if (!auth.ready() || !auth.ExternalRegistryAnchorVerified() ||
+        registry == Digest{} || anchor != registry ||
+        !validate_accountability_signature_capabilities(
+            signature_capabilities))
+        return {};
+    std::vector<u64> words = {
+        domain, static_cast<u64>(auth.world_size()),
+        signature_capabilities.scheme_id,
+        static_cast<u64>(signature_capabilities.public_key_bytes),
+        static_cast<u64>(signature_capabilities.signature_bytes)};
+    for (const Digest* digest : {
+             &registry, &anchor,
+             &signature_capabilities.implementation_binding,
+             &signature_capabilities.capability_binding}) {
+        for (size_t i = 0; i < 4; ++i) {
+            u64 word = 0;
+            std::memcpy(&word, digest->bytes.data() + 8 * i, 8);
+            words.push_back(word);
+        }
+    }
+    return hash_words(words);
+}
+
 Digest load_digest(const std::vector<u64>& words, size_t offset) {
     Digest digest;
     std::memcpy(digest.bytes.data(), words.data() + offset,
@@ -212,6 +240,10 @@ bool decode_and_match(
 }
 
 } // namespace
+
+Digest Ed25519PublicTransferBlameProofBackend::ProductionCapabilityBinding() const {
+    return ed25519_transfer_blame_engine_binding(0x50565452424c5031ULL);
+}
 
 ExternalPublicBlameProof Ed25519PublicTransferBlameProofBackend::Prove(
     const std::vector<u64>& public_inputs,

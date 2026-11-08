@@ -30,6 +30,10 @@ struct KernelResidualContext {
     const PrivateStateMaterialStore& states;
 
     const PrivateStateMaterial* state(size_t index) const;
+    size_t state_segment_count(size_t index) const;
+    bool state_segment(
+        size_t state_index, size_t segment_index,
+        FieldStateSegment* segment) const;
     const std::vector<F>* field_aux(AuditPublicAuxKind kind) const;
     const std::vector<u64>* word_aux(AuditPublicAuxKind kind) const;
 };

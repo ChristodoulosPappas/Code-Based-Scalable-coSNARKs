@@ -16,6 +16,11 @@ public:
     virtual void BindPrivateState(
         const AuditStateView& state,
         const std::vector<F>& local_share) = 0;
+    virtual void BindPrivateStateSegments(
+        const AuditStateView& state, const std::vector<F>& local_share,
+        const std::vector<size_t>&) {
+        BindPrivateState(state, local_share);
+    }
     virtual bool BindPrivateStateAuthentication(
         const AuditStateView& state, uint64_t scheme_id,
         const Digest& authentication_binding) = 0;
@@ -70,6 +75,10 @@ public:
     virtual bool VerifyPublicBlame(
         const BlameCertificate& certificate,
         uint64_t expected_session_id) const = 0;
+    virtual bool ReadRelationProofReceipt(
+        AuditRelationKernel, AuditRelationProofReceipt*) const {
+        return false;
+    }
 };
 
 class SecureAuditBackend final : public AuditBackend {
@@ -82,6 +91,9 @@ public:
     void OnBindPrivateState(
         const AuditStateView& state,
         const std::vector<F>& local_share) override;
+    void OnBindPrivateStateSegments(
+        const AuditStateView& state, const std::vector<F>& local_share,
+        const std::vector<size_t>& segment_lengths) override;
     bool OnBindPrivateStateAuthentication(
         const AuditStateView& state, uint64_t scheme_id,
         const Digest& authentication_binding) override;
@@ -131,6 +143,9 @@ public:
     bool Judge(
         const BlameCertificate& certificate,
         uint64_t expected_session_id) const override;
+    bool ReadRelationProofReceipt(
+        AuditRelationKernel kernel,
+        AuditRelationProofReceipt* receipt) const override;
 
 private:
     SecureAuditProvider& provider_;

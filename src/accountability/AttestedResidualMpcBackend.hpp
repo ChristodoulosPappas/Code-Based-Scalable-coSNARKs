@@ -16,6 +16,7 @@ public:
             RobustAuditSecurityLevel::MALICIOUS_ABORT);
 
     ResidualMpcCapabilities Capabilities() const override;
+    Digest ProductionCapabilityBinding() const override;
     ResidualMpcPrecommitSecurityContext PrecommitSecurityContext(
         const ObligationSet& scope) const override;
     bool ReadyForScope(

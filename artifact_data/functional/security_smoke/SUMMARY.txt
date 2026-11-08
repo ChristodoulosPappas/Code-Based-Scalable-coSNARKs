@@ -1,0 +1,10 @@
+PVIA SECURITY SMOKE: PASS
+np=4
+attached_bundle_public=BOUND
+attached_bundle_local_failure=UNATTRIBUTABLE
+attached_bundle_stale_clear=BOUND
+judge_correct_anchor=ACCEPT
+judge_wrong_anchor=REJECT_RC8
+shamir4_anchored=PASS
+certificate_bytes=2750
+registry_anchor=d0441bd31ad176d5c945db6a354ef92b067cb03c260e5fe3e24b3a3426116d10

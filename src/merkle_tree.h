@@ -19,6 +19,8 @@ void get_int32(vector<unsigned int> &arr, __hhash_digest hash);
 
 __hhash_digest hash_single_field_element(F x);
 
+_hash hash_leaf_blake(const F* leaf4);
+
 __hhash_digest hash_double_field_element_merkle_damgard(virgo::fieldElement x, virgo::fieldElement y, virgo::fieldElement z, virgo::fieldElement w, __hhash_digest prev_hash);
 __hhash_digest _hash_double_field_element_merkle_damgard(prime_field::field_element x, prime_field::field_element y, __hhash_digest prev_hash);
 //void hash_double_field_element_merkle_damgard_blake(virgo::fieldElement x, virgo::fieldElement y, virgo::fieldElement z, virgo::fieldElement w, uint8_t *prev_hash, uint8_t *ret);
@@ -44,6 +46,7 @@ namespace merkle_tree_verifier
     //Merkle tree functions used by the verifier
     bool verify_claim(__hhash_digest root_hhash, const __hhash_digest* tree, __hhash_digest hhash_element, int pos_element, int N);
     bool verify_claim_opt(vector<vector<__hhash_digest>> &MT, const __hhash_digest* path, int pos_element_arr, int N,  bool *visited, double &ps);
+    bool verify_claimed_leaf_blake(vector<vector<_hash>> &MT, const _hash &leaf_hash, const _hash* path, int pos_element_arr, int N, vector<bool> &visited, double &ps);
     bool verify_claim_opt_blake(vector<vector<_hash>> &MT, const _hash* path, int pos_element_arr, int N,  vector<bool> &visited, double &ps);
 
 }

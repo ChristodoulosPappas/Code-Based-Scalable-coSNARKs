@@ -7,6 +7,8 @@
 #include "CollectiveResidualEngine.hpp"
 #include "AuthenticatedAuditRecovery.hpp"
 #include "PublicBlameProof.hpp"
+#include "PublicJudge.hpp"
+#include "TransferAuthentication.hpp"
 #include "MpiAuditScopeSynchronizer.hpp"
 #include "AuditScopeClassifier.hpp"
 #include "PublicTransferCheckEngine.hpp"
@@ -26,16 +28,25 @@ namespace pvia {
 class RelationAwareSecureAuditProvider : public SecureAuditProvider {
 public:
     void RegisterStateMetadata(const AuditStateView& state) final {
-        state_store_.RegisterMetadata(state);
-        OnStoredStateMetadata(state);
+        if (state_store_.RegisterMetadata(state))
+            OnStoredStateMetadata(state);
     }
 
     void BindPrivateState(
         const AuditStateView& state,
         const std::vector<F>& local_share) final {
         if (!capture_private_material_) return;
-        state_store_.BindPrivateState(state, local_share);
-        OnStoredPrivateState(state, local_share);
+        if (state_store_.BindPrivateState(state, local_share))
+            OnStoredPrivateState(state, local_share);
+    }
+
+    void BindPrivateStateSegments(
+        const AuditStateView& state, const std::vector<F>& local_share,
+        const std::vector<size_t>& segment_lengths) final {
+        if (!capture_private_material_) return;
+        if (state_store_.BindPrivateStateSegments(
+                state, local_share, segment_lengths))
+            OnStoredPrivateStateSegments(state, local_share, segment_lengths);
     }
 
     bool BindPrivateStateAuthentication(
@@ -95,9 +106,11 @@ public:
                    RobustAuditAbortStage::ACTIVATION) {
             return false;
         }
-        if (!verify_robust_audit_abort_certificate(
-                candidate, last_robust_abort_.external_registry_anchor))
-            return false;
+        // last_robust_abort_valid_ is set only after VerifyPublicAbort() has
+        // succeeded for this checkpoint/activation.  Return the assembled
+        // artifact here without re-running full certificate verification; the
+        // Runtime/Judge boundary verifies the complete certificate exactly once
+        // before publication or external use.
         *certificate = candidate;
         return true;
     }
@@ -173,10 +186,16 @@ public:
                 last_robust_output_ = robust_session_backend_->Execute(
                     partition.private_scope, collective_rank_,
                     collective_world_size_);
-                if (!validate_robust_audit_session_output(
+                const bool robust_output_valid =
+                    validate_robust_audit_session_output(
                         partition.private_scope, RobustCapabilities(),
                         *activation, last_robust_output_,
-                        collective_world_size_)) {
+                        collective_world_size_) &&
+                    (last_robust_output_.clean ||
+                     robust_session_backend_->VerifyPublicBlame(
+                         last_robust_output_.statement,
+                         last_robust_output_.proof));
+                if (!robust_output_valid) {
                     const AuditCheckpointView* checkpoint =
                         FindCheckpointView(partition.private_scope.checkpoint);
                     RobustAuditAbortOutput abort;
@@ -489,6 +508,7 @@ public:
 
         PublicBlameStatement statement;
         PublicBlameProofArtifact proof;
+        std::vector<u64> portable_recovery_words;
         if (audit.evidence_kind == AuditEvidenceKind::PRIVATE_RECOVERY) {
             const OperationRef ref{violation.label.owner, violation.label.object_id};
             const AuthenticatedRecoveryArtifact* recovery =
@@ -496,6 +516,9 @@ public:
             if (!recovery || !ValidateRecoveredAuditShare(
                     violation, audit, *recovery))
                 return unavailable;
+            portable_recovery_words =
+                encode_authenticated_recovery_artifact(*recovery);
+            if (portable_recovery_words.empty()) return unavailable;
             if (last_private_used_robust_session_) {
                 if (!RobustPrivateRouteReady() ||
                     last_robust_output_.clean ||
@@ -560,6 +583,16 @@ public:
         cert.predecessor_root = audit.predecessor_root;
         cert.checkpoint_root = audit.checkpoint_root;
         cert.audit_witness_digest = audit.witness_digest;
+        cert.recovery_artifact_words = std::move(portable_recovery_words);
+        cert.recovery_proof_system_id = proof.recovery_proof_system_id;
+        cert.recovery_proof_statement_binding =
+            proof.recovery_proof_statement_binding;
+        cert.recovery_proof_artifact_commitment =
+            proof.recovery_proof_artifact_commitment;
+        cert.recovery_proof_statement_words =
+            proof.recovery_proof_statement_words;
+        cert.recovery_proof_artifact_bytes =
+            proof.recovery_proof_artifact_bytes;
         cert.blame_statement_binding = statement.statement_binding;
         cert.public_proof_system_id = proof.proof_system_id;
         cert.public_proof_commitment = proof.proof_commitment;
@@ -593,13 +626,51 @@ public:
         proof.proof_commitment = certificate.public_proof_commitment;
         proof.transcript_binding = certificate.public_proof_transcript_binding;
         proof.proof_words = certificate.public_proof_words;
+        proof.recovery_proof_system_id = certificate.recovery_proof_system_id;
+        proof.recovery_proof_statement_binding =
+            certificate.recovery_proof_statement_binding;
+        proof.recovery_proof_artifact_commitment =
+            certificate.recovery_proof_artifact_commitment;
+        proof.recovery_proof_statement_words =
+            certificate.recovery_proof_statement_words;
+        proof.recovery_proof_artifact_bytes =
+            certificate.recovery_proof_artifact_bytes;
         if (!validate_public_blame_proof_artifact(statement, proof))
             return false;
         if (certificate.evidence_kind ==
             AuditEvidenceKind::PRIVATE_RECOVERY) {
+            auto& authenticator = Ed25519TransferAuthenticator::instance();
+            if (!authenticator.ready() ||
+                !authenticator.ExternalRegistryAnchorVerified() ||
+                authenticator.ExternalRegistryAnchor() !=
+                    authenticator.RegistryCommitment() ||
+                !PublicJudge::VerifyRecoveryReceipt(
+                    certificate, authenticator.PublicKeys(),
+                    authenticator.ExternalRegistryAnchor()) ||
+                !PublicJudge::ValidateRecoveryRelationStatement(
+                    certificate, certificate.recovery_proof_statement_words))
+                return false;
+            // Recheck the portable recovery artifact against the verifier's
+            // independently pinned VSS registry/root configuration. The
+            // target's Ed25519 receipt alone is not an independent VSS pin.
+            const AuthenticatedRecoveryRequest recovery_request =
+                make_recovery_request(certificate);
+            AuthenticatedRecoveryArtifact recovery_artifact;
+            if (!recovery_engine_ ||
+                !decode_authenticated_recovery_artifact(
+                    certificate.recovery_artifact_words, &recovery_artifact) ||
+                !recovery_engine_->Verify(recovery_request, recovery_artifact))
+                return false;
+            // Groth16 verification is mandatory for every public recovery
+            // certificate, independent of which blame-proof backend is used.
+            if (!PublicJudge::VerifyRecoveryRelationProof(
+                    certificate,
+                    certificate.recovery_proof_statement_words))
+                return false;
             if (RobustPrivateRouteReady())
-                return robust_session_backend_->VerifyPublicBlame(
-                    statement, proof);
+                return robust_session_backend_ &&
+                    robust_session_backend_->VerifyPublicBlame(
+                        statement, proof);
             return blame_proof_engine_ &&
                 blame_proof_engine_->Verify(statement, proof);
         }
@@ -780,6 +851,11 @@ protected:
     virtual void OnStoredStateMetadata(const AuditStateView&) {}
     virtual void OnStoredPrivateState(
         const AuditStateView&, const std::vector<F>&) {}
+    virtual void OnStoredPrivateStateSegments(
+        const AuditStateView& state, const std::vector<F>& local_share,
+        const std::vector<size_t>&) {
+        OnStoredPrivateState(state, local_share);
+    }
     virtual void OnStoredPrivateStateAuthentication(
         const AuditStateView&, uint64_t, const Digest&) {}
 
@@ -1107,6 +1183,35 @@ private:
             cert.public_proof_transcript_binding == Digest{} ||
             cert.public_proof_words.empty())
             return false;
+        if (cert.evidence_kind == AuditEvidenceKind::PRIVATE_RECOVERY) {
+            const AuthenticatedRecoveryRequest request =
+                make_recovery_request(cert);
+            AuthenticatedRecoveryArtifact recovery;
+            if (cert.recovery_artifact_words.empty() ||
+                request.request_binding == Digest{} ||
+                !decode_authenticated_recovery_artifact(
+                    cert.recovery_artifact_words, &recovery) ||
+                !validate_recovery_artifact(request, recovery) ||
+                !recovery_engine_ ||
+                !recovery_engine_->Verify(request, recovery) ||
+                compute_recovery_artifact_binding(recovery) !=
+                    audit.witness_digest ||
+                recovery.predecessor_root != audit.predecessor_root ||
+                recovery.checkpoint_root != audit.checkpoint_root ||
+                cert.recovery_proof_system_id != 68103 ||
+                cert.recovery_proof_statement_binding == Digest{} ||
+                cert.recovery_proof_artifact_commitment == Digest{} ||
+                cert.recovery_proof_statement_words.size() != 85 ||
+                cert.recovery_proof_artifact_bytes.empty() ||
+                !PublicJudge::ValidateRecoveryRelationStatement(
+                    cert, cert.recovery_proof_statement_words))
+                return false;
+        } else if (!cert.recovery_artifact_words.empty() ||
+                   cert.recovery_proof_system_id != 0 ||
+                   !cert.recovery_proof_statement_words.empty() ||
+                   !cert.recovery_proof_artifact_bytes.empty()) {
+            return false;
+        }
         return true;
     }
 

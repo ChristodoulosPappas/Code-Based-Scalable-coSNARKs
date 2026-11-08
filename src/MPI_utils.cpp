@@ -5,6 +5,7 @@
 #include "accountability/AccountableAggregation.hpp"
 #include "accountability/JointPackedPreprocessing.hpp"
 #include "accountability/AuthenticatedMpcExchange.hpp"
+#include "accountability/ExperimentMetrics.hpp"
 #include <cstdlib>
 #include <cstring>
 extern vector<vector<pair<int,int>>> A,B,C;
@@ -18,12 +19,16 @@ extern timer pt_cp,vt;
 extern int com_rounds;
 
 namespace {
-void enforce_pvia_prebroadcast_release_gate(const char* release_name) {
+void enforce_pvia_prebroadcast_release_gate(
+    const char* release_name,
+    pvia::Phase phase_override = pvia::Phase::UNKNOWN,
+    uint32_t round_override = 0) {
     if (!release_name) return;
     auto& rt = pvia::Runtime::instance();
     if (!rt.enabled()) return;
-    const pvia::Phase phase = rt.pending_phase();
-    const uint32_t round = rt.pending_round();
+    const bool explicit_scope = phase_override != pvia::Phase::UNKNOWN;
+    const pvia::Phase phase = explicit_scope ? phase_override : rt.pending_phase();
+    const uint32_t round = explicit_scope ? round_override : rt.pending_round();
     if (phase != pvia::Phase::UNKNOWN &&
         rt.pre_release_gate(release_name, phase, round))
         return;
@@ -574,7 +579,8 @@ vector<quadratic_poly> batch_aggregate(vector<quadratic_poly> H, vector<vector<F
         MPI_Isend(coef_u.data(),coef_u.size(),MPI_UINT64_T,0,0,MPI_COMM_WORLD,&req);
         MPI_Wait(&req,MPI_STATUS_IGNORE);
     }
-    enforce_pvia_prebroadcast_release_gate(release_name);
+    enforce_pvia_prebroadcast_release_gate(
+        release_name, pvia::Phase::PCS, static_cast<uint32_t>(round));
     myBcast(coef_u,N);
     if (pvia_on)
         pvia::publish_rank0_aggregate_meta(pvia_aggregate_meta, coef_u, rank);
@@ -595,7 +601,7 @@ vector<quadratic_poly> batch_aggregate(vector<quadratic_poly> H, vector<vector<F
 
 }
 
-quadratic_poly aggregate_quadratic_poly(quadratic_poly H, int k, int _k, int N, const char* release_name){
+quadratic_poly aggregate_quadratic_poly(quadratic_poly H, int k, int _k, int N, const char* release_name, pvia::Phase gate_phase, uint32_t gate_round){
     int rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank); //get my process id
     F a = F(0),b = F(0),c = F(0);
@@ -690,7 +696,7 @@ quadratic_poly aggregate_quadratic_poly(quadratic_poly H, int k, int _k, int N, 
         //MPI_Recv(coef_u.data(),6,MPI_UINT64_T,0,0,MPI_COMM_WORLD,MPI_STATUS_IGNORE);
         //a = coef[0];b = coef[1];c = coef[2]; 
     }
-    enforce_pvia_prebroadcast_release_gate(release_name);
+    enforce_pvia_prebroadcast_release_gate(release_name, gate_phase, gate_round);
     myBcast(coef_u,N);
     if (pvia_on) pvia::publish_rank0_aggregate_meta(
         pvia_aggregate_meta, coef_u, rank);
@@ -701,7 +707,13 @@ quadratic_poly aggregate_quadratic_poly(quadratic_poly H, int k, int _k, int N, 
     return H;
 }
 
-quadratic_poly aggregate_quadratic_poly(quadratic_poly H, vector<F> &v, int k, int _k, int N, const char* release_name){
+quadratic_poly aggregate_quadratic_poly(
+    quadratic_poly H, int k, int _k, int N, const char* release_name) {
+    return aggregate_quadratic_poly(
+        H, k, _k, N, release_name, pvia::Phase::UNKNOWN, 0);
+}
+
+quadratic_poly aggregate_quadratic_poly(quadratic_poly H, vector<F> &v, int k, int _k, int N, const char* release_name, pvia::Phase gate_phase, uint32_t gate_round){
     int rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank); //get my process id
     F a = F(0),b = F(0),c = F(0);
@@ -794,7 +806,7 @@ quadratic_poly aggregate_quadratic_poly(quadratic_poly H, vector<F> &v, int k, i
         //MPI_Send(coef_u.data(),6,MPI_UINT64_T,0,0,MPI_COMM_WORLD);
         //MPI_Recv(coef_u.data(),6,MPI_UINT64_T,0,0,MPI_COMM_WORLD,MPI_STATUS_IGNORE);
     }
-    enforce_pvia_prebroadcast_release_gate(release_name);
+    enforce_pvia_prebroadcast_release_gate(release_name, gate_phase, gate_round);
     myBcast(coef_u,N);
     if (pvia_on) pvia::publish_rank0_aggregate_meta(
         pvia_aggregate_meta, coef_u, rank);
@@ -806,6 +818,13 @@ quadratic_poly aggregate_quadratic_poly(quadratic_poly H, vector<F> &v, int k, i
     return H;
 }
 
+
+quadratic_poly aggregate_quadratic_poly(
+    quadratic_poly H, vector<F> &v, int k, int _k, int N,
+    const char* release_name) {
+    return aggregate_quadratic_poly(
+        H, v, k, _k, N, release_name, pvia::Phase::UNKNOWN, 0);
+}
 
 vector<F> zero_check_sumcheck_local(vector<F> final_v1, vector<F> final_v2, 
                                     vector<F> final_v3, vector<F> h1, 
@@ -1374,7 +1393,9 @@ vector<pair<F,vector<F>>> F_quadratic_sumcheck_rest(F v1, F v2, F y, int k, int 
 }
 
 
-cubic_poly aggregate_cubic_poly(cubic_poly H, vector<F> &v, int k, int _k, int N, const char* release_name){
+cubic_poly aggregate_cubic_poly(
+    cubic_poly H, vector<F> &v, int k, int _k, int N,
+    const char* release_name, pvia::Phase gate_phase, uint32_t gate_round){
     int rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank); //get my process id
     F a = F(0),b = F(0),c = F(0),d = F(0);
@@ -1491,7 +1512,8 @@ cubic_poly aggregate_cubic_poly(cubic_poly H, vector<F> &v, int k, int _k, int N
         //field_vector_deserialize(coef_u,coef);
         //a = coef[0];b = coef[1];c = coef[2];d = coef[3]; 
     }
-    enforce_pvia_prebroadcast_release_gate(release_name);
+    enforce_pvia_prebroadcast_release_gate(
+        release_name, gate_phase, gate_round);
     myBcast(coef_u,N);
     if (pvia_on) pvia::publish_rank0_aggregate_meta(
         pvia_aggregate_meta, coef_u, rank);
@@ -1502,6 +1524,15 @@ cubic_poly aggregate_cubic_poly(cubic_poly H, vector<F> &v, int k, int _k, int N
 }
 
 
+
+
+cubic_poly aggregate_cubic_poly(
+    cubic_poly H, vector<F> &v, int k, int _k, int N,
+    const char* release_name) {
+    return aggregate_cubic_poly(
+        H, v, k, _k, N, release_name,
+        pvia::Phase::UNKNOWN, pvia::Runtime::instance().pending_round());
+}
 F distributed_eval(vector<F> &poly, vector<F> &beta1, vector<F> &beta2, int N){
     int rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank); //get my process id
@@ -2281,7 +2312,8 @@ void distribute_proving_data(vector<F> &vL, vector<F> &vR, vector<F> &vO, vector
         }
 
         pvia::AuthenticatedMpcMessageContext context;
-        context.protocol_domain = 0x505649494e505554ULL; // PVIINPUT
+        context.protocol_domain =
+            pvia::AUTHENTICATED_MPC_BASELINE_INPUT_DOMAIN;
         context.sid = rt.session_id();
         context.checkpoint = bootstrap_checkpoint;
         context.round = 0;
@@ -2354,6 +2386,19 @@ void distribute_proving_data(vector<F> &vL, vector<F> &vR, vector<F> &vO, vector
         for(size_t i = 0; i < vR.size(); i++) vR[i] = buff[i + vL.size()];
         for(size_t i = 0; i < vO.size(); i++) vO[i] = buff[i + 2*vL.size()];
         for(size_t i = 0; i < w.size(); i++) w[i] = buff[i + 3*vL.size()];
+    }
+
+    // The native prover sends exactly this input-share payload regardless of
+    // whether PVIA authenticates the transport. Record it in both scenarios so
+    // communication comparisons use an identical end-to-end boundary.
+    const uint64_t baseline_input_bytes =
+        static_cast<uint64_t>(words_per_receiver * sizeof(u64));
+    if (rank == 0) {
+        pvia::experiment_add_baseline_input_payload_traffic(
+            baseline_input_bytes * static_cast<uint64_t>(N - 1), 0);
+    } else {
+        pvia::experiment_add_baseline_input_payload_traffic(
+            0, baseline_input_bytes);
     }
 
     if (rt.enabled()) {
@@ -2445,4 +2490,50 @@ void setup_randomness(vector<F> &R, int N, int _k, int k, int size, uint64_t joi
         field_vector_deserialize(buff_u64,R);         
           
     }
+}
+
+void setup_randomness_pair(
+    vector<F> &R, vector<F> &R2, int N, int _k, int k, int size,
+    uint64_t joint_domain, uint64_t joint_domain2) {
+    int rank;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    if (!pvia::Runtime::instance().enabled()) {
+        setup_randomness(R, N, _k, k, size, joint_domain);
+        setup_randomness(R2, N, _k, k, size, joint_domain2);
+        return;
+    }
+    if (size <= 0 || joint_domain == 0 || joint_domain2 == 0 ||
+        joint_domain == joint_domain2) {
+        if (rank == 0)
+            printf("[PVIA][preprocessing] invalid paired randomness request\n");
+        std::exit(15);
+    }
+
+    const size_t count = static_cast<size_t>(size);
+    if (count > std::numeric_limits<size_t>::max() / 2) {
+        if (rank == 0)
+            printf("[PVIA][preprocessing] paired randomness size overflow\n");
+        std::exit(15);
+    }
+    std::vector<F> combined;
+    pvia::JointPackedPreprocessingResult joint_result;
+    // R and R2 are two disjoint slices of one vector of independently sampled
+    // random field elements.  This preserves their independence while sharing
+    // a single preprocessing collective.
+    if (!pvia::generate_joint_packed_random_share(
+            2 * count, N, k, _k,
+            0x5056505242504149ULL, // PVP RBPAI: paired randomness batch
+            &combined, &joint_result, MPI_COMM_WORLD) ||
+        !joint_result.ok || combined.size() != 2 * count) {
+        if (rank == 0)
+            printf("[PVIA][preprocessing] paired randomness unavailable\n");
+        std::exit(15);
+    }
+    R.assign(
+        combined.begin(),
+        combined.begin() + static_cast<std::ptrdiff_t>(count));
+    R2.assign(
+        combined.begin() + static_cast<std::ptrdiff_t>(count),
+        combined.end());
 }

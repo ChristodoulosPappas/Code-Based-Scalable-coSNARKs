@@ -1,4 +1,5 @@
 #include "MultiplicationConsistencyProviderAcceptance.hpp"
+#include "AuthenticatedMpcExchange.hpp"
 
 #include "ReferenceBivariateVss.hpp"
 #include "ReferenceShamirMpc.hpp"
@@ -67,12 +68,38 @@ bool run_multiplication_consistency_provider_acceptance(
     result->capability_binding = capabilities.capability_binding;
 
     const int threshold = (world_size - 1) / 3;
+    constexpr uint64_t sid = 0x50564d4341430001ULL;
+    constexpr CheckpointId checkpoint = 0x50564d4341430002ULL;
     ReferenceBivariateVss vss(rank, world_size, threshold, comm);
+    AuthenticatedMpcExchange authenticated_exchange(rank, world_size, comm);
     ReferenceShamirMpc mpc(
         rank, world_size, threshold, comm, &backend);
     if (!vss.valid() || !mpc.valid() ||
         !mpc.multiplication_consistency_available())
         return false;
+
+    const bool local_transport_ready =
+        authenticated_exchange.production_authenticated_ready();
+    const bool all_transport_ready =
+        all_ranks_true(local_transport_ready, comm);
+    const bool no_transport_ready =
+        all_ranks_true(!local_transport_ready, comm);
+    if (!all_transport_ready && !no_transport_ready)
+        return false;
+    if (all_transport_ready) {
+        const bool local_transport_installed =
+            mpc.SetAuthenticatedTransport(
+                &authenticated_exchange, sid, checkpoint);
+        if (!all_ranks_true(local_transport_installed, comm))
+            return false;
+        result->authenticated_transport_used = true;
+        result->authenticated_transport_capability_binding =
+            authenticated_exchange.ProductionCapabilityBinding();
+        if (!all_ranks_true(
+                result->authenticated_transport_capability_binding !=
+                    Digest{}, comm))
+            return false;
+    }
     result->completed_stage = 2;
 
     const F lhs_secret(13, 5);
@@ -103,9 +130,6 @@ bool run_multiplication_consistency_provider_acceptance(
         !validate_reference_vss_local_witness(rhs_local_witness))
         return false;
     result->completed_stage = 3;
-
-    constexpr uint64_t sid = 0x50564d4341430001ULL;
-    constexpr CheckpointId checkpoint = 0x50564d4341430002ULL;
 
     ReferenceMultiplicationConsistencyContext multiply_context;
     multiply_context.sid = sid;
@@ -140,6 +164,7 @@ bool run_multiplication_consistency_provider_acceptance(
             &product_share, &multiplication_binding) ||
         multiplication_binding == Digest{})
         return false;
+    result->completed_stage = 4;
     F opened_product(0);
     Digest product_opening_binding{};
     if (!mpc.Open(
@@ -147,13 +172,13 @@ bool run_multiplication_consistency_provider_acceptance(
             &product_opening_binding) ||
         product_opening_binding == Digest{})
         return false;
+    result->completed_stage = 5;
     result->multiplication_verified =
         opened_product == lhs_secret * rhs_secret;
     result->multiplication_binding = multiplication_binding;
-    result->completed_stage = 4;
     if (!all_ranks_true(result->multiplication_verified, comm))
         return false;
-    result->completed_stage = 5;
+    result->completed_stage = 6;
 
     F zero_share(0);
     ReferenceLinearSharingProvenance zero_provenance;
@@ -163,7 +188,7 @@ bool run_multiplication_consistency_provider_acceptance(
             &zero_sharing_binding) ||
         zero_sharing_binding == Digest{})
         return false;
-    result->completed_stage = 6;
+    result->completed_stage = 7;
     ReferenceMaskedZeroConsistencyContext zero_context;
     zero_context.sid = sid;
     zero_context.checkpoint = checkpoint;
@@ -187,7 +212,7 @@ bool run_multiplication_consistency_provider_acceptance(
     result->zero_case_binding = zero_consistency_binding;
     if (!all_ranks_true(result->zero_case_verified, comm))
         return false;
-    result->completed_stage = 7;
+    result->completed_stage = 8;
 
     const F local_nonzero = rank == 0 ? F(1) : F(0);
     F nonzero_share(0);
@@ -198,7 +223,7 @@ bool run_multiplication_consistency_provider_acceptance(
             &nonzero_provenance, &nonzero_sharing_binding) ||
         nonzero_sharing_binding == Digest{})
         return false;
-    result->completed_stage = 8;
+    result->completed_stage = 9;
     ReferenceMaskedZeroConsistencyContext nonzero_context;
     nonzero_context.sid = sid;
     nonzero_context.checkpoint = checkpoint;
@@ -222,7 +247,7 @@ bool run_multiplication_consistency_provider_acceptance(
     result->nonzero_case_binding = nonzero_consistency_binding;
     if (!all_ranks_true(result->nonzero_case_verified, comm))
         return false;
-    result->completed_stage = 9;
+    result->completed_stage = 10;
 
     std::vector<u64> acceptance_words = {
         ACCEPTANCE_DOMAIN,
@@ -231,11 +256,17 @@ bool run_multiplication_consistency_provider_acceptance(
         sid,
         checkpoint};
     append_digest_words(result->capability_binding, &acceptance_words);
+    acceptance_words.push_back(
+        result->authenticated_transport_used ? 1ULL : 0ULL);
+    if (result->authenticated_transport_used)
+        append_digest_words(
+            result->authenticated_transport_capability_binding,
+            &acceptance_words);
     append_digest_words(result->multiplication_binding, &acceptance_words);
     append_digest_words(result->zero_case_binding, &acceptance_words);
     append_digest_words(result->nonzero_case_binding, &acceptance_words);
     result->acceptance_binding = hash_words(acceptance_words);
-    result->completed_stage = 10;
+    result->completed_stage = 11;
     result->available =
         result->acceptance_binding != Digest{} &&
         result->capabilities_ready &&

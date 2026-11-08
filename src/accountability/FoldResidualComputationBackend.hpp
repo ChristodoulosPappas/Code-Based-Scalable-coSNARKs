@@ -19,6 +19,12 @@ public:
     PrivateResidualHandle EvaluateKernel(
         const KernelResidualContext& context) const override;
 
+    // Apply an externally issued provenance receipt to an already computed
+    // residual. The share is replaced only after full receipt verification.
+    bool AuthenticateStoredShare(
+        const OperationRef& ref,
+        const PrivateResidualShareAuthenticator& authenticator);
+
 private:
     PrivateResidualShareStore& store_;
     const PrivateResidualShareAuthenticator* authenticator_ = nullptr;

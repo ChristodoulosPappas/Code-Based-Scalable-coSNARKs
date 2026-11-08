@@ -107,6 +107,26 @@ ResidualMpcCapabilities AttestedResidualMpcBackend::Capabilities() const {
     return out;
 }
 
+Digest AttestedResidualMpcBackend::ProductionCapabilityBinding() const {
+    const Digest data_plane_binding =
+        data_plane_.ProductionCapabilityBinding();
+    if (data_plane_binding == Digest{}) return {};
+    const ResidualMpcCapabilities residual = Capabilities();
+    const ResidualMpcMaliciousSecurityCapabilities security =
+        security_provider_.Capabilities();
+    if (!residual_mpc_satisfies(residual, required_security_) ||
+        !residual_mpc_malicious_security_satisfies(
+            security, required_security_))
+        return {};
+    std::vector<u64> words = {
+        0x5056414154545052ULL, // PVAATTPR
+        static_cast<u64>(required_security_)};
+    append_digest(data_plane_binding, &words);
+    append_digest(residual.capability_binding, &words);
+    append_digest(security.capability_binding, &words);
+    return hash_words(words);
+}
+
 ResidualMpcPrecommitSecurityContext
 AttestedResidualMpcBackend::PrecommitSecurityContext(
     const ObligationSet& scope) const {

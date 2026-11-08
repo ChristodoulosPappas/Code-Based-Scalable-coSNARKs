@@ -28,6 +28,11 @@ struct LocalResidualBatchView {
     bool all_authenticated = false;
 };
 
+// Canonical local source root; PRIVATE trust anchor, never a public
+// localization certificate. Rejects invalid or duplicate handle layouts.
+Digest compute_private_residual_local_handle_root(
+    const std::vector<PrivateResidualHandle>& handles);
+
 class PrivateResidualRegistry {
 public:
     void Put(const PrivateResidualHandle& handle);

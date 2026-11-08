@@ -1,8 +1,0 @@
-[package]
-name = "pvia-mc-relation"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-blake3 = { version = "1.8.2", features = ["pure"] }
-serde = { version = "1", features = ["derive"] }

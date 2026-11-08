@@ -29,6 +29,7 @@ struct ReferenceVssReceipt {
     size_t element_count = 0;
     Digest local_row_commitment{};
     Digest transcript_binding{};
+    ReferenceVssTranscriptContext transcript_context{};
 };
 
 struct ReferenceVssDealerWitness {
@@ -112,6 +113,36 @@ public:
         const AuthenticatedMpcMessageContext& context,
         ReferenceVssDealerWitness* dealer_witness = nullptr,
         ReferenceVssLocalWitness* local_witness = nullptr) const;
+
+    // Batched scalar VSS for a deterministic prefix of dealers. Each active
+    // dealer still samples an independent symmetric bivariate polynomial and
+    // receives an independent receipt. Only the transport rounds are packed.
+    // This path is intended for scalar resharing/randomness/degree reduction.
+    bool ShareScalarsFromPrefixDealersAuthenticated(
+        int dealer_count, const F& local_dealer_plaintext,
+        std::vector<F>* local_shares,
+        std::vector<ReferenceVssReceipt>* receipts,
+        const AuthenticatedMpcExchange& exchange,
+        const AuthenticatedMpcMessageContext& context,
+        std::vector<ReferenceVssLocalWitness>* local_witnesses = nullptr,
+        std::vector<ReferenceVssDealerWitness>* dealer_witnesses = nullptr) const;
+
+    // Generalization of the scalar-prefix batch to a fixed-width vector per
+    // active dealer.  The output is dealer-major:
+    // local_shares[dealer * element_count + element].
+    // Each dealer receives one receipt/local witness covering its complete
+    // vector, while rows/cross-check/finalization share the same three
+    // authenticated transport stages across all elements and dealers.
+    bool ShareVectorsFromPrefixDealersAuthenticated(
+        int dealer_count,
+        const std::vector<F>& local_dealer_plaintext,
+        size_t element_count,
+        std::vector<F>* local_shares,
+        std::vector<ReferenceVssReceipt>* receipts,
+        const AuthenticatedMpcExchange& exchange,
+        const AuthenticatedMpcMessageContext& context,
+        std::vector<ReferenceVssLocalWitness>* local_witnesses = nullptr,
+        std::vector<ReferenceVssDealerWitness>* dealer_witnesses = nullptr) const;
 
     static bool SelfTest(int rank, int world_size);
 

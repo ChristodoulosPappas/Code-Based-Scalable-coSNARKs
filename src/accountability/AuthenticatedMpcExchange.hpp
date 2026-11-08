@@ -12,6 +12,8 @@ namespace pvia {
 constexpr u64 AUTHENTICATED_MPC_SIGNATURE_DOMAIN =
     0x50564d5043415554ULL; // PVMPCAUT
 constexpr uint32_t AUTHENTICATED_MPC_BROADCAST_RECEIVER = 0xffffffffU;
+constexpr u64 AUTHENTICATED_MPC_BASELINE_INPUT_DOMAIN =
+    0x505649494e505554ULL; // PVIINPUT
 
 struct AuthenticatedMpcEquivocationEvidence;
 struct AuthenticatedMpcSignedEnvelopeObservation;
@@ -36,6 +38,16 @@ std::vector<u64> build_authenticated_mpc_signed_message(
     const AuthenticatedMpcMessageContext& context,
     uint32_t sender, uint32_t receiver, size_t world_size,
     uint64_t payload_word_count, const Digest& payload_binding);
+
+// Observational message *shape* for an independently verified session.
+// No plaintext, payload digest, signature or session identifier is included.
+// Test instrumentation only: shape equality is not cryptographic privacy.
+struct AuthenticatedMpcEnvelopeShapeTrace {
+    bool available = false;
+    uint64_t verified_messages = 0;
+    Digest arrival_order_binding{};
+    Digest canonical_multiset_binding{};
+};
 
 struct AuthenticatedMpcTransportCapabilities {
     bool available = false;
@@ -164,6 +176,12 @@ public:
     bool ExportVerifiedEnvelopeObservations(
         uint64_t sid, CheckpointId checkpoint,
         std::vector<AuthenticatedMpcSignedEnvelopeObservation>* observations) const;
+    // Profiles only the already-verified receive-side envelope contexts.
+    // Normalizes SID to support independent runs of identical public layout.
+    // Equal digest does NOT imply payload or timing indistinguishability.
+    bool ExportVerifiedEnvelopeShapeTrace(
+        uint64_t sid, CheckpointId checkpoint,
+        AuthenticatedMpcEnvelopeShapeTrace* trace) const;
     // Best-effort authenticated dissemination of redacted observations. This
     // improves evidence availability but is not reliable broadcast/liveness/GOD.
     bool ReconcileCheckpointObservations(
@@ -193,7 +211,8 @@ private:
         AuthenticatedMpcMessageContext context{};
         uint32_t sender = 0;
         uint32_t receiver = 0;
-        std::vector<u64> payload;
+        uint64_t payload_word_count = 0;
+        Digest payload_binding{};
         std::array<uint8_t, 64> signature{};
     };
     struct SequenceHighWaterRecord {

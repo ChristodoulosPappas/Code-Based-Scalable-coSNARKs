@@ -243,43 +243,28 @@ ObligationSet MpiAuditScopeSynchronizer::SynchronizeAuthenticated(
     AuthenticatedMpcExchange exchange(rank, world_size);
     if (!exchange.production_authenticated_ready()) return unavailable;
 
-    AuthenticatedMpcMessageContext broadcast_context;
-    broadcast_context.protocol_domain = SCOPE_SYNC_PROTOCOL_DOMAIN;
-    broadcast_context.sid = local_scope.session_id;
-    broadcast_context.checkpoint = local_scope.checkpoint;
-    broadcast_context.round = local_scope.round;
-    broadcast_context.sequence = sync_sequence;
-    broadcast_context.message_kind = SCOPE_SYNC_BROADCAST_KIND;
+    // Every participant already constructs the complete failure scope locally.
+    // The previous protocol first authenticated a coordinator broadcast of that
+    // full scope and then ran a second authenticated all-gather of its digest.
+    // Since acceptance required every local scope to equal the coordinator
+    // scope, this is equivalent to authenticating each participant's scope
+    // binding once and requiring unanimous equality.  This removes one
+    // collective and also keeps all ranks in the same collective when a local
+    // mismatch is present instead of allowing an early-return divergence.
+    const Digest local_scope_binding =
+        compute_collective_scope_binding(local_scope);
+    if (local_scope_binding == Digest{}) return unavailable;
 
-    std::vector<u64> coordinator_payload;
-    if (rank == coordinator_rank) coordinator_payload = encode_scope(local_scope);
-    std::vector<u64> received;
-    Digest broadcast_binding{};
-    if ((rank == coordinator_rank && coordinator_payload.empty()) ||
-        !exchange.BroadcastWords(
-            broadcast_context, coordinator_rank, coordinator_payload,
-            &received, &broadcast_binding) || broadcast_binding == Digest{})
-        return unavailable;
-
-    ObligationSet canonical;
-    if (!decode_scope(received, &canonical) ||
-        canonical.session_id != local_scope.session_id ||
-        canonical.phase != local_scope.phase ||
-        canonical.round != local_scope.round ||
-        canonical.generation != local_scope.generation ||
-        canonical.checkpoint != local_scope.checkpoint ||
-        canonical.checkpoint_root != local_scope.checkpoint_root)
-        return unavailable;
-    const Digest scope_binding = compute_collective_scope_binding(canonical);
-    const Digest local_scope_binding = compute_collective_scope_binding(local_scope);
-    if (scope_binding == Digest{} || local_scope_binding == Digest{} ||
-        scope_binding != local_scope_binding)
-        return unavailable;
-
-    AuthenticatedMpcMessageContext agreement_context = broadcast_context;
+    AuthenticatedMpcMessageContext agreement_context;
+    agreement_context.protocol_domain = SCOPE_SYNC_PROTOCOL_DOMAIN;
+    agreement_context.sid = local_scope.session_id;
+    agreement_context.checkpoint = local_scope.checkpoint;
+    agreement_context.round = local_scope.round;
+    agreement_context.sequence = sync_sequence;
     agreement_context.message_kind = SCOPE_SYNC_AGREE_KIND;
+
     std::vector<u64> local_binding_words;
-    append_digest(scope_binding, &local_binding_words);
+    append_digest(local_scope_binding, &local_binding_words);
     std::vector<u64> gathered_bindings;
     Digest agreement_binding{};
     if (!exchange.AllGatherWords(
@@ -288,12 +273,14 @@ ObligationSet MpiAuditScopeSynchronizer::SynchronizeAuthenticated(
         gathered_bindings.size() != static_cast<size_t>(world_size) * 4 ||
         agreement_binding == Digest{})
         return unavailable;
+
     for (int participant = 0; participant < world_size; ++participant) {
-        if (read_digest(gathered_bindings,
-                static_cast<size_t>(participant) * 4) != scope_binding)
+        if (read_digest(
+                gathered_bindings,
+                static_cast<size_t>(participant) * 4) != local_scope_binding)
             return unavailable;
     }
-    return canonical;
+    return local_scope;
 }
 
 } // namespace pvia

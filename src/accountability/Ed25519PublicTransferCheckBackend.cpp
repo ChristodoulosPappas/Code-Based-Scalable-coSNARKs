@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <map>
+#include <limits>
 #include <vector>
 
 namespace pvia {
@@ -21,6 +23,34 @@ struct CanonicalTransferFact {
     Digest metadata_binding{};
     bool mismatch = false;
 };
+
+Digest ed25519_transfer_engine_binding(u64 domain) {
+    auto& auth = Ed25519TransferAuthenticator::instance();
+    const auto signature_capabilities = auth.SignatureCapabilities();
+    const Digest registry = auth.RegistryCommitment();
+    const Digest anchor = auth.ExternalRegistryAnchor();
+    if (!auth.ready() || !auth.ExternalRegistryAnchorVerified() ||
+        registry == Digest{} || anchor != registry ||
+        !validate_accountability_signature_capabilities(
+            signature_capabilities))
+        return {};
+    std::vector<u64> words = {
+        domain, static_cast<u64>(auth.world_size()),
+        signature_capabilities.scheme_id,
+        static_cast<u64>(signature_capabilities.public_key_bytes),
+        static_cast<u64>(signature_capabilities.signature_bytes)};
+    for (const Digest* digest : {
+             &registry, &anchor,
+             &signature_capabilities.implementation_binding,
+             &signature_capabilities.capability_binding}) {
+        for (size_t i = 0; i < 4; ++i) {
+            u64 word = 0;
+            std::memcpy(&word, digest->bytes.data() + 8 * i, 8);
+            words.push_back(word);
+        }
+    }
+    return hash_words(words);
+}
 
 void append_digest_words(const Digest& digest, std::vector<u64>* words) {
     if (!words) return;
@@ -89,35 +119,101 @@ bool derive_canonical_facts(
     int rank,
     int world_size,
     std::vector<CanonicalTransferFact>* facts) {
-    if (!facts || !runtime_matches(rank, world_size)) return false;
+    if (!facts || !runtime_matches(rank, world_size) ||
+        scope.operations.empty())
+        return false;
     facts->clear();
     facts->reserve(scope.operations.size());
 
-    for (const auto& ref : scope.operations) {
-        PublicTransferObservation local;
-        bool local_conflict = false;
-        const bool local_present = local_candidate_for_ref(
-            ref, local_observations, &local, &local_conflict);
+    struct LocalCandidate {
+        bool found = false;
+        bool conflict = false;
+        bool mismatch = false;
+        Digest metadata_binding{};
+    };
 
-        std::array<u64, 7> send{};
-        send[0] = local_present ? 1ULL : 0ULL;
-        send[1] = local_conflict ? 1ULL : 0ULL;
-        send[2] = local_present &&
-            local.registered_digest != local.payload_digest ? 1ULL : 0ULL;
-        if (local_present)
-            digest_to_words(local.metadata_binding, &send[3]);
+    const size_t operation_count = scope.operations.size();
+    if (operation_count >
+        static_cast<size_t>(std::numeric_limits<int>::max() / 7))
+        return false;
 
-        std::vector<u64> gathered(static_cast<size_t>(world_size) * send.size());
-        MPI_Allgather(send.data(), static_cast<int>(send.size()), MPI_UINT64_T,
-                      gathered.data(), static_cast<int>(send.size()),
-                      MPI_UINT64_T, MPI_COMM_WORLD);
+    // Map one operation reference to every matching position in the scope.
+    // A scope should normally contain unique references, but retaining all
+    // positions preserves the previous behavior even for a duplicated ref.
+    using RefKey = std::pair<uint32_t, uint64_t>;
+    std::map<RefKey, std::vector<size_t>> positions;
+    for (size_t i = 0; i < operation_count; ++i) {
+        const auto& ref = scope.operations[i];
+        positions[{ref.owner, ref.object_id}].push_back(i);
+    }
 
+    std::vector<LocalCandidate> local(operation_count);
+    // The previous implementation revalidated every local observation once
+    // for every scope operation. Validate each observation exactly once, then
+    // distribute its authenticated fact to matching scope positions.
+    for (const auto& observation : local_observations) {
+        const auto pos_it = positions.find(
+            {observation.ref.owner, observation.ref.object_id});
+        if (pos_it == positions.end()) continue;
+        if (!validate_public_transfer_observation(observation)) continue;
+
+        const bool mismatch =
+            observation.registered_digest != observation.payload_digest;
+        for (size_t index : pos_it->second) {
+            LocalCandidate& candidate = local[index];
+            if (!candidate.found) {
+                candidate.found = true;
+                candidate.mismatch = mismatch;
+                candidate.metadata_binding = observation.metadata_binding;
+                continue;
+            }
+            if (candidate.metadata_binding != observation.metadata_binding ||
+                candidate.mismatch != mismatch)
+                candidate.conflict = true;
+        }
+    }
+
+    // Seven words per operation:
+    // present | conflict | mismatch | metadata_binding[4].
+    // Batch every operation into one collective instead of one Allgather per
+    // operation. The canonical fact ordering remains scope.operations order.
+    constexpr size_t WORDS_PER_FACT = 7;
+    const size_t local_word_count = operation_count * WORDS_PER_FACT;
+    std::vector<u64> send(local_word_count, 0);
+    for (size_t i = 0; i < operation_count; ++i) {
+        const size_t base = i * WORDS_PER_FACT;
+        send[base + 0] = local[i].found ? 1ULL : 0ULL;
+        send[base + 1] = local[i].conflict ? 1ULL : 0ULL;
+        send[base + 2] =
+            local[i].found && local[i].mismatch ? 1ULL : 0ULL;
+        if (local[i].found)
+            digest_to_words(local[i].metadata_binding, &send[base + 3]);
+    }
+
+    if (local_word_count >
+        static_cast<size_t>(std::numeric_limits<int>::max()))
+        return false;
+    if (local_word_count >
+        std::numeric_limits<size_t>::max() /
+            static_cast<size_t>(world_size))
+        return false;
+
+    std::vector<u64> gathered(
+        static_cast<size_t>(world_size) * local_word_count);
+    MPI_Allgather(
+        send.data(), static_cast<int>(local_word_count), MPI_UINT64_T,
+        gathered.data(), static_cast<int>(local_word_count), MPI_UINT64_T,
+        MPI_COMM_WORLD);
+
+    for (size_t i = 0; i < operation_count; ++i) {
         bool found = false;
         Digest canonical_binding{};
         bool canonical_mismatch = false;
         for (int peer = 0; peer < world_size; ++peer) {
-            const u64* row = gathered.data() +
-                static_cast<size_t>(peer) * send.size();
+            const size_t base =
+                static_cast<size_t>(peer) * local_word_count +
+                i * WORDS_PER_FACT;
+            const u64* row = gathered.data() + base;
             if (row[1] != 0) return false;
             if (row[0] == 0) continue;
             const Digest binding = words_to_digest(&row[3]);
@@ -133,14 +229,16 @@ bool derive_canonical_facts(
                 return false;
         }
         if (!found || canonical_binding == Digest{}) return false;
+
         CanonicalTransferFact fact;
-        fact.ref = ref;
+        fact.ref = scope.operations[i];
         fact.metadata_binding = canonical_binding;
         fact.mismatch = canonical_mismatch;
         facts->push_back(fact);
     }
     return true;
 }
+
 Digest compute_transcript_binding(
     const ObligationSet& scope,
     const std::vector<CanonicalTransferFact>& facts) {
@@ -245,6 +343,10 @@ Digest compute_localization_commitment(
 
 } // namespace
 
+Digest Ed25519PublicTransferCheckBackend::ProductionCapabilityBinding() const {
+    return ed25519_transfer_engine_binding(0x5056545243484b31ULL);
+}
+
 PublicTransferCheckResult Ed25519PublicTransferCheckBackend::Check(
     const ObligationSet& scope,
     const std::vector<PublicTransferObservation>& local_observations,
@@ -252,6 +354,11 @@ PublicTransferCheckResult Ed25519PublicTransferCheckBackend::Check(
     int world_size) const {
     PublicTransferCheckResult result;
     result.checkpoint = scope.checkpoint;
+    cached_scope_binding_ = Digest{};
+    cached_check_binding_ = Digest{};
+    cached_refs_.clear();
+    cached_metadata_bindings_.clear();
+    cached_mismatches_.clear();
     if (scope.operations.empty() || scope.session_id == 0 ||
         scope.checkpoint == 0 || !runtime_matches(rank, world_size))
         return result;
@@ -273,6 +380,21 @@ PublicTransferCheckResult Ed25519PublicTransferCheckBackend::Check(
     result.transcript_binding = compute_transcript_binding(scope, facts);
     result.authentication_commitment = compute_authentication_commitment(
         scope, facts, result.transcript_binding);
+
+    const Digest scope_binding = compute_collective_scope_binding(scope);
+    const Digest check_binding = compute_public_transfer_check_binding(result);
+    if (scope_binding != Digest{} && check_binding != Digest{}) {
+        cached_scope_binding_ = scope_binding;
+        cached_check_binding_ = check_binding;
+        cached_refs_.reserve(facts.size());
+        cached_metadata_bindings_.reserve(facts.size());
+        cached_mismatches_.reserve(facts.size());
+        for (const auto& fact : facts) {
+            cached_refs_.push_back(fact.ref);
+            cached_metadata_bindings_.push_back(fact.metadata_binding);
+            cached_mismatches_.push_back(fact.mismatch ? 1U : 0U);
+        }
+    }
     return result;
 }
 CollectiveDisputeResult Ed25519PublicTransferCheckBackend::Dispute(
@@ -288,9 +410,39 @@ CollectiveDisputeResult Ed25519PublicTransferCheckBackend::Dispute(
         return result;
 
     std::vector<CanonicalTransferFact> facts;
-    if (!derive_canonical_facts(
+    const Digest scope_binding = compute_collective_scope_binding(scope);
+    const Digest check_binding = compute_public_transfer_check_binding(check);
+    const bool cache_shape_ok =
+        cached_scope_binding_ == scope_binding &&
+        cached_check_binding_ == check_binding &&
+        cached_refs_.size() == check.checked_operations &&
+        cached_refs_.size() == cached_metadata_bindings_.size() &&
+        cached_refs_.size() == cached_mismatches_.size();
+
+    if (cache_shape_ok) {
+        facts.reserve(cached_refs_.size());
+        for (size_t i = 0; i < cached_refs_.size(); ++i) {
+            CanonicalTransferFact fact;
+            fact.ref = cached_refs_[i];
+            fact.metadata_binding = cached_metadata_bindings_[i];
+            fact.mismatch = cached_mismatches_[i] != 0;
+            facts.push_back(fact);
+        }
+        // Cache use is allowed only if the cached facts still reproduce the
+        // complete authenticated batch statement supplied to Dispute().
+        if (compute_transcript_binding(scope, facts) !=
+                check.transcript_binding ||
+            compute_authentication_commitment(
+                scope, facts, check.transcript_binding) !=
+                check.authentication_commitment)
+            facts.clear();
+    }
+
+    if (facts.empty() &&
+        !derive_canonical_facts(
             scope, local_observations, rank, world_size, &facts))
         return result;
+
     const CanonicalTransferFact* mismatch = first_mismatch(facts);
     if (!mismatch) return result;
     if (compute_transcript_binding(scope, facts) != check.transcript_binding ||

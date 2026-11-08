@@ -4,6 +4,35 @@
 #include <cstring>
 
 namespace pvia {
+
+Digest compute_private_residual_local_handle_root(
+    const std::vector<PrivateResidualHandle>& handles) {
+    // Registry canonicalizes before computing the root. Independent users
+    // of a pinned view must use precisely the same owner/object ordering.
+    for(size_t i=0;i<handles.size();++i){
+        const auto& current=handles[i];
+        if(!current.available || !current.authenticated ||
+           current.commitment==Digest{} || current.checkpoint==0 ||
+           (i>0 && (handles[i-1].ref.owner>current.ref.owner ||
+                (handles[i-1].ref.owner==current.ref.owner &&
+                 handles[i-1].ref.object_id>=current.ref.object_id))))
+            return {};
+    }
+    std::vector<u64> words;
+    for(const auto& handle:handles) {
+        words.push_back(handle.ref.owner);
+        words.push_back(handle.ref.object_id);
+        words.push_back(static_cast<u64>(handle.relation));
+        words.push_back(static_cast<u64>(handle.kernel));
+        for(size_t i=0;i<4;++i) {
+            u64 part=0;
+            std::memcpy(&part,handle.commitment.bytes.data()+8*i,8);
+            words.push_back(part);
+        }
+    }
+    return hash_words(words);
+}
+
 namespace {
 
 bool same_ref(const OperationRef& lhs, const OperationRef& rhs) {
@@ -84,20 +113,12 @@ LocalResidualBatchView PrivateResidualRegistry::BuildLocalBatchView(
     view.complete_for_owner = scope.operations.empty() ||
                               expected_local == view.handles.size();
     view.all_authenticated = view.complete_for_owner;
-    std::vector<u64> words;
-    for (const auto& handle : view.handles) {
+    for (const auto& handle : view.handles)
         view.all_authenticated = view.all_authenticated && handle.authenticated;
-        words.push_back(handle.ref.owner);
-        words.push_back(handle.ref.object_id);
-        words.push_back(static_cast<u64>(handle.relation));
-        words.push_back(static_cast<u64>(handle.kernel));
-        for (size_t i = 0; i < 4; ++i) {
-            u64 word = 0;
-            std::memcpy(&word, handle.commitment.bytes.data() + 8 * i, 8);
-            words.push_back(word);
-        }
-    }
-    view.commitment_root = hash_words(words);
+    view.commitment_root =
+        compute_private_residual_local_handle_root(view.handles);
+    view.all_authenticated = view.all_authenticated &&
+        view.commitment_root != Digest{};
     return view;
 }
 

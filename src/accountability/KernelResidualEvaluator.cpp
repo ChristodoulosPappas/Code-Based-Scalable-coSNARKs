@@ -86,6 +86,36 @@ const PrivateStateMaterial* KernelResidualContext::state(size_t index) const {
     if (index >= material.state_dependencies.size()) return nullptr;
     return states.Find(material.state_dependencies[index]);
 }
+size_t KernelResidualContext::state_segment_count(size_t index) const {
+    const PrivateStateMaterial* material_state = state(index);
+    return material_state ? material_state->segment_lengths.size() : 0;
+}
+
+bool KernelResidualContext::state_segment(
+    size_t state_index, size_t segment_index,
+    FieldStateSegment* segment) const {
+    if (!segment) return false;
+    const PrivateStateMaterial* material_state = state(state_index);
+    if (!material_state || !material_state->has_private_share ||
+        segment_index >= material_state->segment_lengths.size() ||
+        !states.VerifySegmentLayout(material_state->state.id))
+        return false;
+    size_t offset = 0;
+    for (size_t i = 0; i < segment_index; ++i) {
+        const size_t length = material_state->segment_lengths[i];
+        if (offset > material_state->local_share.size() - length)
+            return false;
+        offset += length;
+    }
+    const size_t count = material_state->segment_lengths[segment_index];
+    if (offset > material_state->local_share.size() ||
+        count > material_state->local_share.size() - offset)
+        return false;
+    *segment = FieldStateSegment{
+        &material_state->local_share, offset, count};
+    return true;
+}
+
 const std::vector<F>* KernelResidualContext::field_aux(
     AuditPublicAuxKind kind) const {
     for (const auto& item : material.field_aux)

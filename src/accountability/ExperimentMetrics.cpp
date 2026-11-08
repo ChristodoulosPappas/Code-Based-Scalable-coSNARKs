@@ -81,6 +81,29 @@ void experiment_add_authenticated_envelope_traffic(
     g_metrics.authenticated_envelope_recv_messages += recv_messages;
 }
 
+void experiment_add_authenticated_traffic_breakdown(
+    uint64_t payload_sent_bytes, uint64_t payload_recv_bytes,
+    uint64_t overhead_sent_bytes, uint64_t overhead_recv_bytes,
+    bool baseline_equivalent_payload) {
+    if (!g_metrics.enabled) return;
+    if (baseline_equivalent_payload) {
+        g_metrics.authenticated_baseline_payload_sent_bytes += payload_sent_bytes;
+        g_metrics.authenticated_baseline_payload_recv_bytes += payload_recv_bytes;
+    } else {
+        g_metrics.authenticated_pvia_payload_sent_bytes += payload_sent_bytes;
+        g_metrics.authenticated_pvia_payload_recv_bytes += payload_recv_bytes;
+    }
+    g_metrics.authenticated_overhead_sent_bytes += overhead_sent_bytes;
+    g_metrics.authenticated_overhead_recv_bytes += overhead_recv_bytes;
+}
+
+void experiment_add_baseline_input_payload_traffic(
+    uint64_t sent_bytes, uint64_t recv_bytes) {
+    if (!g_metrics.enabled) return;
+    g_metrics.baseline_input_payload_sent_bytes += sent_bytes;
+    g_metrics.baseline_input_payload_recv_bytes += recv_bytes;
+}
+
 void experiment_increment_authenticated_collective() {
     if (g_metrics.enabled) ++g_metrics.authenticated_collective_calls;
 }
@@ -184,6 +207,16 @@ void experiment_add_duration(
         case ExperimentDurationKind::TRANSFER_METADATA_VERIFY:
             ++g_metrics.transfer_metadata_verify_calls;
             g_metrics.transfer_metadata_verify_ns += duration_ns; break;
+        case ExperimentDurationKind::RUNTIME_INIT:
+            g_metrics.runtime_init_ns += duration_ns; break;
+        case ExperimentDurationKind::PREPROCESSING:
+            g_metrics.preprocessing_ns += duration_ns; break;
+        case ExperimentDurationKind::INITIAL_VALIDITY:
+            g_metrics.initial_validity_ns += duration_ns; break;
+        case ExperimentDurationKind::PUBLIC_DIRECT_VALIDATION:
+            g_metrics.public_direct_validation_ns += duration_ns; break;
+        case ExperimentDurationKind::CONSISTENCY_PROVIDER:
+            g_metrics.consistency_provider_ns += duration_ns; break;
     }
 }
 
@@ -209,6 +242,10 @@ bool emit_experiment_metrics_csv(
     g_metrics.peak_rss_kb = process_peak_rss_kb();
     std::ostringstream row;
     row << "label,session_id,rank,world_size,program_total_ns,peak_rss_kb,auth_sent_bytes,auth_recv_bytes,"
+        << "auth_baseline_payload_sent_bytes,auth_baseline_payload_recv_bytes,"
+        << "auth_pvia_payload_sent_bytes,auth_pvia_payload_recv_bytes,"
+        << "auth_overhead_sent_bytes,auth_overhead_recv_bytes,"
+        << "baseline_input_payload_sent_bytes,baseline_input_payload_recv_bytes,"
         << "auth_sent_messages,auth_recv_messages,auth_collective_calls,"
         << "control_sent_bytes,control_recv_bytes,control_sent_messages,"
         << "control_recv_messages,control_collective_calls,"
@@ -233,6 +270,8 @@ bool emit_experiment_metrics_csv(
         << "transfer_meta_seal_calls,transfer_meta_seal_ns,"
         << "transfer_meta_observe_calls,transfer_meta_observe_ns,"
         << "transfer_meta_verify_calls,transfer_meta_verify_ns,"
+        << "runtime_init_ns,preprocessing_ns,initial_validity_ns,"
+        << "public_direct_validation_ns,consistency_provider_ns,"
         << "failure_handling_calls,failure_total_ns,scope_sync_ns,batch_check_ns,"
         << "termination_query_ns,cert_fetch_ns,cert_verify_ns,cert_encode_ns,"
         << "cert_export_ns,cert_canonical_bytes,public_abort_events,"
@@ -242,6 +281,14 @@ bool emit_experiment_metrics_csv(
         << g_metrics.peak_rss_kb << ','
         << g_metrics.authenticated_envelope_sent_bytes << ','
         << g_metrics.authenticated_envelope_recv_bytes << ','
+        << g_metrics.authenticated_baseline_payload_sent_bytes << ','
+        << g_metrics.authenticated_baseline_payload_recv_bytes << ','
+        << g_metrics.authenticated_pvia_payload_sent_bytes << ','
+        << g_metrics.authenticated_pvia_payload_recv_bytes << ','
+        << g_metrics.authenticated_overhead_sent_bytes << ','
+        << g_metrics.authenticated_overhead_recv_bytes << ','
+        << g_metrics.baseline_input_payload_sent_bytes << ','
+        << g_metrics.baseline_input_payload_recv_bytes << ','
         << g_metrics.authenticated_envelope_sent_messages << ','
         << g_metrics.authenticated_envelope_recv_messages << ','
         << g_metrics.authenticated_collective_calls << ','
@@ -279,6 +326,11 @@ bool emit_experiment_metrics_csv(
         << g_metrics.transfer_metadata_observe_ns << ','
         << g_metrics.transfer_metadata_verify_calls << ','
         << g_metrics.transfer_metadata_verify_ns << ','
+        << g_metrics.runtime_init_ns << ','
+        << g_metrics.preprocessing_ns << ','
+        << g_metrics.initial_validity_ns << ','
+        << g_metrics.public_direct_validation_ns << ','
+        << g_metrics.consistency_provider_ns << ','
         << g_metrics.failure_handling_calls << ',' << g_metrics.failure_total_ns << ','
         << g_metrics.scope_sync_ns << ',' << g_metrics.batch_check_ns << ','
         << g_metrics.robust_termination_query_ns << ','

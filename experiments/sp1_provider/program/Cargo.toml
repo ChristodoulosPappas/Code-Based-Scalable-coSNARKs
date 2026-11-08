@@ -1,8 +1,0 @@
-[package]
-name = "pvia-sp1-relation-program"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-sp1-zkvm = { version = "=6.8.1" }
-pvia-mc-relation = { path = "../relation" }

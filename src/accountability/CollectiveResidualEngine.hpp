@@ -70,6 +70,7 @@ bool validate_collective_dispute_result(
 class CollectiveResidualEngine {
 public:
     virtual ~CollectiveResidualEngine() = default;
+    virtual Digest ProductionCapabilityBinding() const { return {}; }
 
     virtual BatchCheckResult BatchCheck(
         const ObligationSet& scope,

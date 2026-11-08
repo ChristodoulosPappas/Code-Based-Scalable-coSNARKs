@@ -12,6 +12,12 @@ void SecureAuditBackend::OnBindPrivateState(
     provider_.BindPrivateState(state, local_share);
 }
 
+void SecureAuditBackend::OnBindPrivateStateSegments(
+    const AuditStateView& state, const std::vector<F>& local_share,
+    const std::vector<size_t>& segment_lengths) {
+    provider_.BindPrivateStateSegments(state, local_share, segment_lengths);
+}
+
 bool SecureAuditBackend::OnBindPrivateStateAuthentication(
     const AuditStateView& state, uint64_t scheme_id,
     const Digest& authentication_binding) {
@@ -119,6 +125,14 @@ bool SecureAuditBackend::Judge(
     const BlameCertificate& certificate,
     uint64_t expected_session_id) const {
     return provider_.VerifyPublicBlame(certificate, expected_session_id);
+}
+
+bool SecureAuditBackend::ReadRelationProofReceipt(
+    AuditRelationKernel kernel,
+    AuditRelationProofReceipt* receipt) const {
+    if (!receipt) return false;
+    *receipt = AuditRelationProofReceipt{};
+    return provider_.ReadRelationProofReceipt(kernel, receipt);
 }
 
 } // namespace pvia

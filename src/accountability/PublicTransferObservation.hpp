@@ -2,6 +2,8 @@
 
 #include "PVIA.hpp"
 
+#include <unordered_map>
+
 namespace pvia {
 
 constexpr size_t PUBLIC_TRANSFER_OBSERVATION_BASE_WORDS = 49;
@@ -55,6 +57,10 @@ public:
 
 private:
     std::vector<PublicTransferObservation> observations_;
+    std::unordered_map<CheckpointId, std::vector<size_t>>
+        checkpoint_index_;
+    std::unordered_map<OperationRef, std::vector<size_t>, OperationRefHash>
+        ref_index_;
 };
 
 } // namespace pvia

@@ -1,0 +1,22 @@
+PVIA ABORT LATENCY: PASS
+np=64
+repeats=10
+warmup=1
+public_failure_mean_ms=38.594336
+public_failure_median_ms=38.916735
+public_failure_p95_ms=39.370178
+public_failure_stddev_ms=0.772515
+public_scope_sync_mean_ms=17.537046
+public_batch_check_mean_ms=25.216923
+public_termination_query_mean_ms=0.000681
+public_cert_verify_mean_ms=0.765714
+public_cert_bytes=3504
+replay_failure_mean_ms=34.188596
+replay_failure_median_ms=34.149361
+replay_failure_p95_ms=35.709862
+replay_failure_stddev_ms=1.126443
+replay_scope_sync_mean_ms=17.710980
+replay_batch_check_mean_ms=22.532202
+replay_termination_query_mean_ms=0.000608
+replay_cert_verify_mean_ms=0.000000
+replay_cert_bytes=0

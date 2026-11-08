@@ -32,6 +32,10 @@ public:
     }
 
 private:
+    friend bool run_reference_god_output_bundle_n4_selftest(int, int, const std::string&, const std::string&, const std::string&);
+    const MultiplicationConsistencyProofBackend* backend() const {
+        return session_ ? &session_->backend() : nullptr;
+    }
     MultiplicationConsistencyProofArtifact Prove(
         const MultiplicationConsistencyStatement& statement,
         const MultiplicationConsistencyWitness& witness) const;
@@ -52,6 +56,7 @@ private:
     MultiplicationConsistencyCapabilities capabilities_{};
     std::unique_ptr<ExternalMultiplicationConsistencyProviderSession> session_;
     std::string error_;
+    mutable std::string provider_operation_error_;
 };
 
 } // namespace pvia

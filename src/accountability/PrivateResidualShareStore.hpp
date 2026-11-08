@@ -2,6 +2,8 @@
 
 #include "PVIA.hpp"
 
+#include <array>
+
 #include <vector>
 
 namespace pvia {
@@ -20,6 +22,12 @@ struct PrivateResidualAuthenticationArtifact {
     Digest operation_statement_binding{};
     Digest proof_commitment{};
     Digest transcript_binding{};
+    // Present for externally signed provenance receipts. Legacy isolated
+    // selftests may leave these fields zero; production verifiers must pin
+    // issuer identity/key and verify the signature explicitly.
+    uint64_t issuer_id = 0;
+    uint64_t issuer_sequence = 0;
+    std::array<uint8_t,64> proof_signature{};
     Digest binding{};
 };
 
@@ -36,6 +44,8 @@ struct PrivateResidualShare {
     StateId source_state_id = 0;
     uint32_t source_state_owner = 0;
     Digest source_state_digest{};
+    // Nonzero for native Sumcheck residuals; binds the private segment partition.
+    Digest source_state_layout_binding{};
     uint64_t source_state_authentication_scheme_id = 0;
     Digest source_state_authentication_binding{};
     Digest public_aux_root{};

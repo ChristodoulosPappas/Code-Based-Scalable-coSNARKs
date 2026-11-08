@@ -1,4 +1,6 @@
 #include "ReferenceBivariateVss.hpp"
+#include "ReferenceVssResidualSourceLink.hpp"
+#include "ReferenceVssShareRecovery.hpp"
 #include "ProtocolTrafficMetrics.hpp"
 #include "MultiplicationConsistencyProviderAbiC.h"
 
@@ -24,6 +26,13 @@ constexpr u64 VSS_AUTH_ROWS = 0x56535341524f5753ULL; // VSSAROWS
 constexpr u64 VSS_AUTH_CROSS = 0x5653534143524f53ULL; // VSSACROS
 constexpr u64 VSS_AUTH_CONSISTENCY = 0x56535341434f4e53ULL; // VSSACONS
 constexpr u64 VSS_AUTH_COMMITMENTS = 0x56535341434d4954ULL; // VSSACMIT
+constexpr u64 VSS_AUTH_BATCH_READY = 0x5653424154524459ULL; // VSBATRDY
+constexpr u64 VSS_AUTH_BATCH_ROWS = 0x5653424154524f57ULL; // VSBATROW
+constexpr u64 VSS_AUTH_BATCH_CROSS = 0x5653424154435253ULL; // VSBATCRS
+constexpr u64 VSS_AUTH_BATCH_CONSISTENCY = 0x5653424154434f4eULL; // VSBATCON
+constexpr u64 VSS_AUTH_BATCH_COMMITMENTS = 0x5653424154434d54ULL; // VSBATCMT
+constexpr u64 VSS_AUTH_BATCH_FINAL = 0x565342415446494eULL; // VSBATFIN
+constexpr u64 VSS_BATCH_BINDING_DOMAIN = 0x5056565353424154ULL; // PVVSSBAT
 
 void pack_field(const F& value, u64* out) {
     out[0] = value.real;
@@ -108,6 +117,21 @@ AuthenticatedMpcMessageContext vss_subcontext(
     context.message_kind = base.message_kind ^ stage;
     if (context.message_kind == 0) context.message_kind = stage;
     return context;
+}
+
+Digest derive_vss_batch_transport_binding(
+    const AuthenticatedMpcMessageContext& base,
+    u64 stage, int dealer, const Digest& batch_binding) {
+    if (!validate_authenticated_mpc_message_context(base) ||
+        stage == 0 || dealer < 0 || batch_binding == Digest{})
+        return {};
+    std::vector<u64> words = {
+        VSS_BATCH_BINDING_DOMAIN, stage,
+        static_cast<u64>(dealer)};
+    append_digest_words(
+        compute_authenticated_mpc_context_binding(base), &words);
+    append_digest_words(batch_binding, &words);
+    return hash_words(words);
 }
 
 } // namespace
@@ -517,6 +541,461 @@ bool ReferenceBivariateVss::ShareVectorFromDealerAuthenticated(
         dealer_witness, local_witness, &exchange, &context);
 }
 
+bool ReferenceBivariateVss::ShareScalarsFromPrefixDealersAuthenticated(
+    int dealer_count, const F& local_dealer_plaintext,
+    std::vector<F>* local_shares,
+    std::vector<ReferenceVssReceipt>* receipts,
+    const AuthenticatedMpcExchange& exchange,
+    const AuthenticatedMpcMessageContext& context,
+    std::vector<ReferenceVssLocalWitness>* local_witnesses,
+    std::vector<ReferenceVssDealerWitness>* dealer_witnesses) const {
+    const std::vector<F> plaintext = {local_dealer_plaintext};
+    return ShareVectorsFromPrefixDealersAuthenticated(
+        dealer_count, plaintext, 1, local_shares, receipts,
+        exchange, context, local_witnesses, dealer_witnesses);
+}
+
+bool ReferenceBivariateVss::ShareVectorsFromPrefixDealersAuthenticated(
+    int dealer_count,
+    const std::vector<F>& local_dealer_plaintext,
+    size_t element_count,
+    std::vector<F>* local_shares,
+    std::vector<ReferenceVssReceipt>* receipts,
+    const AuthenticatedMpcExchange& exchange,
+    const AuthenticatedMpcMessageContext& context,
+    std::vector<ReferenceVssLocalWitness>* local_witnesses,
+    std::vector<ReferenceVssDealerWitness>* dealer_witnesses) const {
+    if (!valid() || dealer_count <= 0 || dealer_count > world_size_ ||
+        element_count == 0 ||
+        local_dealer_plaintext.size() != element_count ||
+        !local_shares || !receipts ||
+        !exchange.production_authenticated_ready() ||
+        !validate_authenticated_mpc_message_context(context))
+        return false;
+
+    local_shares->clear();
+    receipts->clear();
+    if (local_witnesses) local_witnesses->clear();
+    if (dealer_witnesses) dealer_witnesses->clear();
+
+    const size_t dimension = static_cast<size_t>(threshold_ + 1);
+    if (dimension == 0 ||
+        dimension > std::numeric_limits<size_t>::max() / dimension)
+        return false;
+    const size_t matrix_fields = dimension * dimension;
+    if (element_count >
+            std::numeric_limits<size_t>::max() / matrix_fields ||
+        dimension >
+            static_cast<size_t>(std::numeric_limits<int>::max()) / 2)
+        return false;
+    const size_t dealer_matrix_fields = element_count * matrix_fields;
+
+    const bool active_dealer = rank_ < dealer_count;
+    std::vector<F> local_coefficients;
+    int local_ready = 1;
+    if (active_dealer) {
+        local_coefficients.assign(dealer_matrix_fields, F(0));
+        const size_t upper_random =
+            dimension * (dimension + 1) / 2 - 1;
+        if (upper_random > 0 &&
+            element_count >
+                std::numeric_limits<size_t>::max() / upper_random)
+            return false;
+        std::vector<F> random_coefficients;
+        if (upper_random > 0 &&
+            !random_field_vector(
+                element_count * upper_random, &random_coefficients)) {
+            local_ready = 0;
+        } else {
+            size_t random_index = 0;
+            for (size_t element = 0;
+                 element < element_count; ++element) {
+                const size_t matrix_base =
+                    element * matrix_fields;
+                for (size_t a = 0; a < dimension; ++a) {
+                    for (size_t b = a; b < dimension; ++b) {
+                        F coefficient;
+                        if (a == 0 && b == 0) {
+                            coefficient =
+                                local_dealer_plaintext[element];
+                        } else {
+                            coefficient =
+                                random_coefficients[random_index++];
+                        }
+                        local_coefficients[
+                            matrix_base + a * dimension + b] =
+                            coefficient;
+                        local_coefficients[
+                            matrix_base + b * dimension + a] =
+                            coefficient;
+                    }
+                }
+            }
+        }
+    }
+
+    // Readiness is piggybacked on the first row exchange.  Each active
+    // dealer contributes element_count independent bivariate polynomials.
+    if (element_count >
+        (std::numeric_limits<size_t>::max() - 1) /
+            (2 * dimension))
+        return false;
+    const size_t row_words_per_receiver =
+        1 + 2 * element_count * dimension;
+    if (row_words_per_receiver >
+        static_cast<size_t>(std::numeric_limits<int>::max()))
+        return false;
+
+    std::vector<u64> row_send(
+        static_cast<size_t>(world_size_) * row_words_per_receiver, 0);
+    for (int recipient = 0; recipient < world_size_; ++recipient) {
+        const size_t recipient_base =
+            static_cast<size_t>(recipient) * row_words_per_receiver;
+        row_send[recipient_base] = local_ready ? 1ULL : 0ULL;
+        if (!active_dealer) continue;
+        const F x(recipient + 1);
+        for (size_t element = 0;
+             element < element_count; ++element) {
+            const size_t matrix_base =
+                element * matrix_fields;
+            for (size_t b = 0; b < dimension; ++b) {
+                F row_coefficient(0);
+                F power(1);
+                for (size_t a = 0; a < dimension; ++a) {
+                    row_coefficient +=
+                        local_coefficients[
+                            matrix_base + a * dimension + b] *
+                        power;
+                    power *= x;
+                }
+                const size_t field_index =
+                    element * dimension + b;
+                pack_field(
+                    row_coefficient,
+                    &row_send[
+                        recipient_base + 1 +
+                        2 * field_index]);
+            }
+        }
+    }
+
+    std::vector<u64> row_recv;
+    Digest rows_binding{};
+    if (!exchange.AllToAllWords(
+            vss_subcontext(context, VSS_AUTH_BATCH_ROWS),
+            row_send, row_words_per_receiver,
+            &row_recv, &rows_binding) ||
+        row_recv.size() != row_send.size() ||
+        rows_binding == Digest{})
+        return false;
+
+    bool observed_ready = true;
+    for (int sender = 0; sender < world_size_; ++sender) {
+        const size_t sender_base =
+            static_cast<size_t>(sender) * row_words_per_receiver;
+        if (row_recv[sender_base] != 1ULL)
+            observed_ready = false;
+    }
+
+    const size_t row_fields_per_dealer =
+        element_count * dimension;
+    std::vector<std::vector<F>> local_rows(
+        static_cast<size_t>(dealer_count),
+        std::vector<F>(row_fields_per_dealer, F(0)));
+    for (int dealer = 0; dealer < dealer_count; ++dealer) {
+        const size_t base =
+            static_cast<size_t>(dealer) *
+                row_words_per_receiver + 1;
+        for (size_t field = 0;
+             field < row_fields_per_dealer; ++field) {
+            local_rows[static_cast<size_t>(dealer)][field] =
+                unpack_field(&row_recv[base + 2 * field]);
+        }
+    }
+
+    if (element_count >
+        std::numeric_limits<size_t>::max() /
+            (2 * static_cast<size_t>(dealer_count)))
+        return false;
+    const size_t cross_words_per_receiver =
+        2 * static_cast<size_t>(dealer_count) *
+        element_count;
+    if (cross_words_per_receiver >
+        static_cast<size_t>(std::numeric_limits<int>::max()))
+        return false;
+    std::vector<u64> cross_send(
+        static_cast<size_t>(world_size_) *
+            cross_words_per_receiver, 0);
+    for (int target = 0; target < world_size_; ++target) {
+        const F target_point(target + 1);
+        const size_t target_base =
+            static_cast<size_t>(target) *
+            cross_words_per_receiver;
+        for (int dealer = 0; dealer < dealer_count; ++dealer) {
+            for (size_t element = 0;
+                 element < element_count; ++element) {
+                const F intersection = evaluate_polynomial(
+                    &local_rows[static_cast<size_t>(dealer)]
+                               [element * dimension],
+                    threshold_, target_point);
+                const size_t field_index =
+                    static_cast<size_t>(dealer) *
+                        element_count + element;
+                pack_field(
+                    intersection,
+                    &cross_send[
+                        target_base + 2 * field_index]);
+            }
+        }
+    }
+
+    std::vector<u64> cross_recv;
+    Digest cross_binding{};
+    if (!exchange.AllToAllWords(
+            vss_subcontext(context, VSS_AUTH_BATCH_CROSS),
+            cross_send, cross_words_per_receiver,
+            &cross_recv, &cross_binding) ||
+        cross_recv.size() != cross_send.size() ||
+        cross_binding == Digest{})
+        return false;
+
+    int local_consistent = observed_ready ? 1 : 0;
+    for (int sender = 0;
+         sender < world_size_ && local_consistent; ++sender) {
+        const F sender_point(sender + 1);
+        const size_t sender_base =
+            static_cast<size_t>(sender) *
+            cross_words_per_receiver;
+        for (int dealer = 0;
+             dealer < dealer_count && local_consistent; ++dealer) {
+            for (size_t element = 0;
+                 element < element_count; ++element) {
+                const F mine = evaluate_polynomial(
+                    &local_rows[static_cast<size_t>(dealer)]
+                               [element * dimension],
+                    threshold_, sender_point);
+                const size_t field_index =
+                    static_cast<size_t>(dealer) *
+                        element_count + element;
+                const F theirs = unpack_field(
+                    &cross_recv[
+                        sender_base + 2 * field_index]);
+                if (mine != theirs) {
+                    local_consistent = 0;
+                    break;
+                }
+            }
+        }
+    }
+
+    std::vector<Digest> local_commitments(
+        static_cast<size_t>(dealer_count));
+    std::vector<u64> commitment_words(
+        static_cast<size_t>(dealer_count) * 4, 0);
+    for (int dealer = 0; dealer < dealer_count; ++dealer) {
+        const Digest commitment =
+            hash_field_vector(
+                local_rows[static_cast<size_t>(dealer)]);
+        if (commitment == Digest{}) return false;
+        local_commitments[static_cast<size_t>(dealer)] =
+            commitment;
+        for (size_t word = 0; word < 4; ++word) {
+            std::memcpy(
+                &commitment_words[
+                    static_cast<size_t>(dealer) * 4 + word],
+                commitment.bytes.data() + 8 * word, 8);
+        }
+    }
+
+    std::vector<u64> final_words(
+        1 + static_cast<size_t>(dealer_count) * 4, 0);
+    final_words[0] = local_consistent ? 1ULL : 0ULL;
+    std::copy(
+        commitment_words.begin(), commitment_words.end(),
+        final_words.begin() + 1);
+
+    std::vector<u64> gathered_final;
+    Digest final_binding{};
+    if (!exchange.AllGatherWords(
+            vss_subcontext(context, VSS_AUTH_BATCH_FINAL),
+            final_words, &gathered_final, &final_binding) ||
+        gathered_final.size() !=
+            static_cast<size_t>(world_size_) *
+                final_words.size() ||
+        final_binding == Digest{})
+        return false;
+
+    std::vector<u64> gathered_commitments(
+        static_cast<size_t>(world_size_) *
+            static_cast<size_t>(dealer_count) * 4, 0);
+    const size_t final_stride = final_words.size();
+    for (int participant = 0;
+         participant < world_size_; ++participant) {
+        const size_t final_base =
+            static_cast<size_t>(participant) * final_stride;
+        if (gathered_final[final_base] != 1ULL)
+            return false;
+        const size_t commit_dst =
+            static_cast<size_t>(participant) *
+            static_cast<size_t>(dealer_count) * 4;
+        std::copy(
+            gathered_final.begin() +
+                static_cast<std::ptrdiff_t>(
+                    final_base + 1),
+            gathered_final.begin() +
+                static_cast<std::ptrdiff_t>(
+                    final_base + 1 +
+                    static_cast<size_t>(dealer_count) * 4),
+            gathered_commitments.begin() +
+                static_cast<std::ptrdiff_t>(commit_dst));
+    }
+
+    const Digest capability_binding =
+        exchange.ProductionCapabilityBinding();
+    if (capability_binding == Digest{}) return false;
+
+    if (static_cast<size_t>(dealer_count) >
+        std::numeric_limits<size_t>::max() /
+            element_count)
+        return false;
+    local_shares->resize(
+        static_cast<size_t>(dealer_count) *
+        element_count);
+    receipts->resize(static_cast<size_t>(dealer_count));
+    if (local_witnesses)
+        local_witnesses->resize(
+            static_cast<size_t>(dealer_count));
+    if (dealer_witnesses)
+        dealer_witnesses->resize(
+            static_cast<size_t>(dealer_count));
+
+    for (int dealer = 0; dealer < dealer_count; ++dealer) {
+        ReferenceVssTranscriptContext transcript_context;
+        transcript_context.world_size = world_size_;
+        transcript_context.authenticated = true;
+        transcript_context.capability_binding =
+            capability_binding;
+        const std::array<std::pair<u64, Digest>, 3>
+            batch_stages = {{
+                {VSS_AUTH_BATCH_ROWS, rows_binding},
+                {VSS_AUTH_BATCH_CROSS, cross_binding},
+                {VSS_AUTH_BATCH_FINAL, final_binding}
+            }};
+        transcript_context.transport_bindings.reserve(
+            batch_stages.size());
+        for (const auto& stage : batch_stages) {
+            const Digest derived =
+                derive_vss_batch_transport_binding(
+                    context, stage.first, dealer,
+                    stage.second);
+            if (derived == Digest{}) return false;
+            transcript_context.transport_bindings.push_back(
+                derived);
+        }
+
+        transcript_context.row_commitments.resize(
+            static_cast<size_t>(world_size_));
+        for (int participant = 0;
+             participant < world_size_; ++participant) {
+            const size_t offset =
+                (static_cast<size_t>(participant) *
+                     static_cast<size_t>(dealer_count) +
+                 static_cast<size_t>(dealer)) * 4;
+            const Digest row_commitment =
+                read_digest_words(
+                    gathered_commitments, offset);
+            if (row_commitment == Digest{})
+                return false;
+            transcript_context.row_commitments[
+                static_cast<size_t>(participant)] =
+                row_commitment;
+        }
+
+        ReferenceVssReceipt receipt;
+        receipt.available = true;
+        receipt.consistent = true;
+        receipt.dealer = dealer;
+        receipt.world_size = world_size_;
+        receipt.threshold = threshold_;
+        receipt.element_count = element_count;
+        receipt.local_row_commitment =
+            local_commitments[
+                static_cast<size_t>(dealer)];
+        receipt.transcript_binding =
+            compute_reference_vss_transcript_binding(
+                dealer, threshold_, element_count,
+                transcript_context);
+        if (receipt.transcript_binding == Digest{})
+            return false;
+
+        for (size_t element = 0;
+             element < element_count; ++element) {
+            (*local_shares)[
+                static_cast<size_t>(dealer) *
+                    element_count + element] =
+                local_rows[static_cast<size_t>(dealer)]
+                          [element * dimension];
+        }
+        (*receipts)[static_cast<size_t>(dealer)] =
+            receipt;
+
+        if (local_witnesses) {
+            ReferenceVssLocalWitness witness;
+            witness.available = true;
+            witness.dealer = dealer;
+            witness.participant = rank_;
+            witness.threshold = threshold_;
+            witness.element_count = element_count;
+            witness.local_row_commitment =
+                receipt.local_row_commitment;
+            witness.transcript_binding =
+                receipt.transcript_binding;
+            witness.transcript_context =
+                transcript_context;
+            witness.local_row_words.resize(
+                2 * row_fields_per_dealer);
+            for (size_t field = 0;
+                 field < row_fields_per_dealer; ++field) {
+                pack_field(
+                    local_rows[static_cast<size_t>(dealer)]
+                              [field],
+                    &witness.local_row_words[2 * field]);
+            }
+            if (!validate_reference_vss_local_witness(
+                    witness))
+                return false;
+            (*local_witnesses)[
+                static_cast<size_t>(dealer)] =
+                std::move(witness);
+        }
+        // The batch already has the dealer's private coefficient matrix and
+        // the complete authenticated transcript context. Return that witness
+        // only to the local dealer so strong multiplication proofs can be
+        // generated in parallel after all VSS receipts are fixed.
+        if (dealer_witnesses && rank_ == dealer) {
+            ReferenceVssDealerWitness witness;
+            witness.available = true;
+            witness.dealer = dealer;
+            witness.threshold = threshold_;
+            witness.element_count = element_count;
+            witness.transcript_binding = receipt.transcript_binding;
+            witness.transcript_context = transcript_context;
+            witness.coefficient_words.resize(
+                2 * local_coefficients.size());
+            for (size_t i = 0; i < local_coefficients.size(); ++i)
+                pack_field(
+                    local_coefficients[i],
+                    &witness.coefficient_words[2 * i]);
+            if (!validate_reference_vss_dealer_witness(witness))
+                return false;
+            (*dealer_witnesses)[static_cast<size_t>(dealer)] =
+                std::move(witness);
+        }
+    }
+
+    return true;
+}
+
 bool ReferenceBivariateVss::ShareVectorInternal(
     int dealer, const std::vector<F>& dealer_plaintext,
     bool inject_dealer_equivocation,
@@ -828,6 +1307,7 @@ bool ReferenceBivariateVss::ShareVectorInternal(
     receipt->threshold = threshold_;
     receipt->element_count = count;
     receipt->local_row_commitment = local_row_commitment;
+    receipt->transcript_context = transcript_context;
     receipt->transcript_binding =
         compute_reference_vss_transcript_binding(
             dealer, threshold_, count, transcript_context);
@@ -922,6 +1402,43 @@ bool ReferenceBivariateVss::SelfTest(int rank, int world_size) {
             local_ok = 0;
     }
 
+    if (local_ok) {
+        std::vector<F> changed_local = local_shares;
+        changed_local[0] += F(1);
+        const Digest bad_transcript = hash_words({
+            0x505649415653534cULL, receipt.element_count});
+        if (!verify_reference_vss_recipient_share_link(
+                local_witness, local_shares, receipt.transcript_binding) ||
+            verify_reference_vss_recipient_share_link(
+                local_witness, changed_local, receipt.transcript_binding) ||
+            verify_reference_vss_recipient_share_link(
+                local_witness, local_shares, bad_transcript) ||
+            verify_reference_vss_recipient_authenticated_share_link(
+                local_witness, local_shares, receipt.transcript_binding,
+                hash_words({0x5056494156535343ULL})))
+            local_ok = 0;
+    }
+
+    if (local_ok && rank == dealer) {
+        // VSS linkage: dealer polynomial's constant coefficients must match
+        // the caller's privately expected vector, not a value supplied by
+        // the witness itself.
+        std::vector<F> tampered_secret = canonical;
+        tampered_secret[0] += F(1);
+        const Digest wrong_transcript = hash_words({
+            0x505649415653534cULL, receipt.element_count});
+        if (!verify_reference_vss_dealer_secret_link(
+                dealer_witness, canonical, receipt.transcript_binding) ||
+            verify_reference_vss_dealer_secret_link(
+                dealer_witness, tampered_secret, receipt.transcript_binding) ||
+            verify_reference_vss_dealer_secret_link(
+                dealer_witness, canonical, wrong_transcript) ||
+            verify_reference_vss_dealer_authenticated_source_link(
+                dealer_witness, canonical, receipt.transcript_binding,
+                hash_words({0x5056494156535343ULL})))
+            local_ok = 0;
+    }
+
     std::vector<u64> local_words(canonical.size() * 2);
     if (local_ok) {
         for (size_t i = 0; i < local_shares.size(); ++i)
@@ -949,7 +1466,103 @@ bool ReferenceBivariateVss::SelfTest(int rank, int world_size) {
             }
         }
     }
-    MPI_Bcast(&local_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    // Diagnostic-only recovery fixture: the MPI selftest exchanges raw
+    // private helper rows ONLY inside this explicit research test. This is
+    // not the privacy-preserving recovery transport or public evidence.
+    const size_t expected_row_words =
+        canonical.size()*static_cast<size_t>(threshold+1)*2;
+    std::vector<u64> row_payload(expected_row_words,0);
+    if(local_witness.local_row_words.size()==expected_row_words)
+        row_payload=local_witness.local_row_words;
+    else local_ok=0;
+    std::vector<u64> gathered_rows(
+        static_cast<size_t>(world_size)*expected_row_words);
+    MPI_Allgather(row_payload.data(),static_cast<int>(expected_row_words),
+                  MPI_UINT64_T,gathered_rows.data(),
+                  static_cast<int>(expected_row_words),
+                  MPI_UINT64_T,MPI_COMM_WORLD);
+    int recovery_ok=local_ok;
+    if(rank==0 && recovery_ok) {
+        auto recovered_matches = [&](int missing,
+                                    const std::vector<ReferenceVssLocalWitness>& rows) {
+            std::vector<F> restored;
+            if(!recover_reference_vss_share_from_rows(
+                   missing,receipt,rows,&restored) ||
+               restored.size()!=canonical.size()) return false;
+            for(size_t k=0;k<canonical.size();++k) {
+                const size_t off=static_cast<size_t>(missing)*
+                                  local_words.size()+2*k;
+                if(restored[k]!=unpack_field(&all_words[off]))
+                    return false;
+            }
+            return true;
+        };
+        const int missing_candidates[] = {0,world_size/2,world_size-1};
+        for(int missing:missing_candidates) {
+            std::vector<ReferenceVssLocalWitness> helpers;
+            for(int participant=0;participant<world_size;++participant) {
+                if(participant==missing)continue;
+                ReferenceVssLocalWitness witness=local_witness;
+                witness.participant=participant;
+                witness.local_row_commitment=
+                    witness.transcript_context.row_commitments[
+                        static_cast<size_t>(participant)];
+                const auto begin=gathered_rows.begin()+
+                    static_cast<size_t>(participant)*expected_row_words;
+                witness.local_row_words.assign(
+                    begin,begin+expected_row_words);
+                helpers.push_back(std::move(witness));
+            }
+            if(!recovered_matches(missing,helpers)) {
+                recovery_ok=0;break;
+            }
+            const size_t required=static_cast<size_t>(threshold+1);
+            std::vector<ReferenceVssLocalWitness> minimal(
+                helpers.begin(),helpers.begin()+required);
+            if(!recovered_matches(missing,minimal)) {
+                recovery_ok=0;break;
+            }
+            std::vector<F> recovered;
+            auto corrupted=helpers;
+            corrupted[0].local_row_words[0]^=1;
+            if(recover_reference_vss_share_from_rows(
+                   missing,receipt,corrupted,&recovered)) {
+                recovery_ok=0;break;
+            }
+            auto repeated=helpers;
+            repeated[1]=repeated[0];
+            if(recover_reference_vss_share_from_rows(
+                   missing,receipt,repeated,&recovered)) {
+                recovery_ok=0;break;
+            }
+            auto too_few=minimal;
+            too_few.pop_back();
+            if(recover_reference_vss_share_from_rows(
+                   missing,receipt,too_few,&recovered)) {
+                recovery_ok=0;break;
+            }
+            auto altered_binding=receipt;
+            altered_binding.transcript_binding.bytes[0]^=1;
+            if(recover_reference_vss_share_from_rows(
+                   missing,altered_binding,helpers,&recovered)) {
+                recovery_ok=0;break;
+            }
+            auto wrong_epoch=helpers;
+            wrong_epoch[0].transcript_binding.bytes[0]^=1;
+            if(recover_reference_vss_share_from_rows(
+                   missing,receipt,wrong_epoch,&recovered)) {
+                recovery_ok=0;break;
+            }
+            auto included_missing=helpers;
+            included_missing[0].participant=missing;
+            if(recover_reference_vss_share_from_rows(
+                   missing,receipt,included_missing,&recovered)) {
+                recovery_ok=0;break;
+            }
+        }
+    }
+    MPI_Bcast(&recovery_ok,1,MPI_INT,0,MPI_COMM_WORLD);
+    local_ok=local_ok && recovery_ok;
 
     std::vector<F> bad_shares;
     ReferenceVssReceipt bad_receipt;
@@ -968,6 +1581,9 @@ bool ReferenceBivariateVss::SelfTest(int rank, int world_size) {
                   << threshold
                   << " honest=" << (local_ok ? "PASS" : "FAIL")
                   << " codec=" << (local_ok ? "BOUND" : "FAIL")
+                  << " share_recovery="
+                  << (recovery_ok ? "PASS" : "FAIL")
+                  << " recovery_inputs=OFFLINE_PRIVATE_TEST_ROWS"
                   << " equivocation="
                   << (detected_all ? "DETECTED" : "MISSED")
                   << " result=" << (global_ok ? "PASS" : "FAIL")
