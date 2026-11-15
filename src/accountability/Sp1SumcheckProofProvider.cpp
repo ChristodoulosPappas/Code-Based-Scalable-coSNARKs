@@ -113,7 +113,7 @@ bool run_independent_verifier(
         const char* rayon_threads =
             std::getenv("PVIA_SP1_SUMCHECK_RAYON_THREADS");
         const std::string home_env =
-            std::string("HOME=") + (home ? home : "/home/liuliangxin");
+            std::string("HOME=") + (home ? home : "/home/user");
         const std::string ld_env =
             std::string("LD_LIBRARY_PATH=") +
             (ld_library_path ? ld_library_path : "");
@@ -586,7 +586,7 @@ bool Sp1SumcheckProofProvider::ProveAndVerify(
         const char* rayon_threads =
             std::getenv("PVIA_SP1_SUMCHECK_RAYON_THREADS");
         const std::string home_env =
-            std::string("HOME=") + (home ? home : "/home/liuliangxin");
+            std::string("HOME=") + (home ? home : "/home/user");
         const std::string ld_env =
             std::string("LD_LIBRARY_PATH=") +
             (ld_library_path ? ld_library_path : "");
